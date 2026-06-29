@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: babft-image-painter
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MAX_W
+        value: 96
+      - key: MAX_H
+        value: 96
+      - key: COLOR_STEP
+        value: 16
