@@ -10,13 +10,14 @@ from PIL import Image
 app = Flask(__name__)
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
-LATEST_FILE = "latest_image.json"
 
+DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 MAX_W = int(os.environ.get("MAX_W", "96"))
 MAX_H = int(os.environ.get("MAX_H", "96"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 COLOR_STEP = int(os.environ.get("COLOR_STEP", "16"))
 
+os.makedirs(DATA_DIR, exist_ok=True)
 
 HTML = """
 <!doctype html>
@@ -33,7 +34,7 @@ HTML = """
             padding: 24px;
         }
         .box {
-            max-width: 720px;
+            max-width: 760px;
             margin: auto;
             background: #1d1d1d;
             border: 1px solid #333;
@@ -47,6 +48,7 @@ HTML = """
             border-radius: 8px;
             border: 0;
             font-size: 15px;
+            box-sizing: border-box;
         }
         button {
             background: #00aaff;
@@ -57,30 +59,30 @@ HTML = """
         .hint {
             color: #aaa;
             font-size: 13px;
-            line-height: 1.4;
+            line-height: 1.45;
         }
         code {
             background: #000;
             padding: 2px 5px;
             border-radius: 4px;
         }
-        .ok {
-            color: #00ff99;
-        }
-        .bad {
-            color: #ff7777;
-        }
+        .ok { color: #00ff99; }
+        .bad { color: #ff7777; }
     </style>
 </head>
 <body>
 <div class="box">
     <h2>BABFT Image Painter</h2>
+
     <p class="hint">
-        Загрузи картинку, сервер превратит её в JSON для Roblox-скрипта.
-        Потом Lua берёт данные с <code>/latest</code>.
+        В Roblox-скрипте открой вкладку <b>Image</b>, скопируй <b>Port</b> и вставь его сюда.
+        Картинка сохранится только в этот порт, поэтому чужие картинки случайно не попадут тебе.
     </p>
 
     <form action="/upload" method="post" enctype="multipart/form-data">
+        <label>Port из Roblox-скрипта:</label>
+        <input name="port" placeholder="Например 54321" required>
+
         <label>Secret key, если включён IMAGE_KEY:</label>
         <input name="key" placeholder="Можно оставить пустым">
 
@@ -96,15 +98,15 @@ HTML = """
         <label>Квантование цвета, например 8 / 16 / 32:</label>
         <input name="color_step" value="{{ color_step }}">
 
-        <button type="submit">Загрузить</button>
+        <button type="submit">Загрузить в этот порт</button>
     </form>
 
     <hr>
 
     <p>Status: {{ status|safe }}</p>
     <p class="hint">
-        Проверка: <code>/ping</code><br>
-        Последняя картинка: <code>/latest</code>
+        Проверка сервера: <code>/ping</code><br>
+        Получить картинку для порта: <code>/latest?port=ТВОЙ_ПОРТ</code>
     </p>
 </div>
 </body>
@@ -112,16 +114,25 @@ HTML = """
 """
 
 
+def clean_port(value: str) -> str:
+    value = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(value) < 3:
+        raise ValueError("Bad port: use at least 3 digits")
+    if len(value) > 8:
+        value = value[:8]
+    return value
+
+
+def port_file(port: str) -> str:
+    port = clean_port(port)
+    return os.path.join(DATA_DIR, f"{port}.json")
+
+
 def check_key(req) -> bool:
     if not IMAGE_KEY:
         return True
 
-    key = ""
-    if req.method == "GET":
-        key = req.args.get("key", "")
-    else:
-        key = req.form.get("key", "") or req.headers.get("X-Image-Key", "")
-
+    key = req.values.get("key", "") or req.headers.get("X-Image-Key", "")
     return key == IMAGE_KEY
 
 
@@ -147,8 +158,8 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
     new_h = max(1, int(h * scale))
 
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
     pixels = img.load()
+
     grid: List[List[Any]] = []
 
     for y in range(new_h):
@@ -163,7 +174,6 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
 
         grid.append(row)
 
-    # 1) Делаем горизонтальные полосы одинакового цвета.
     runs = []
     for y in range(new_h):
         x = 0
@@ -190,7 +200,6 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
 
             x = x2
 
-    # 2) Склеиваем одинаковые полосы по вертикали.
     merged = []
     used = [False] * len(runs)
 
@@ -239,34 +248,44 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
     }
 
 
-def save_latest(data: Dict[str, Any]) -> None:
-    with open(LATEST_FILE, "w", encoding="utf-8") as f:
+def save_latest(port: str, data: Dict[str, Any]) -> None:
+    data["port"] = port
+    with open(port_file(port), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
 
-def load_latest() -> Dict[str, Any]:
-    if not os.path.exists(LATEST_FILE):
+def load_latest(port: str) -> Dict[str, Any]:
+    path = port_file(port)
+
+    if not os.path.exists(path):
         return {
             "ok": False,
-            "error": "No image uploaded yet",
+            "error": f"No image uploaded for port {port} yet",
+            "port": port,
         }
 
-    with open(LATEST_FILE, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 @app.route("/", methods=["GET"])
 def index():
-    latest = load_latest()
+    port = request.args.get("port", "").strip()
+    status = "<span class='bad'>Вставь port из Roblox и загрузи картинку</span>"
 
-    if latest.get("ok"):
-        status = (
-            f"<span class='ok'>Есть картинка</span><br>"
-            f"Size: {latest.get('width')}x{latest.get('height')}<br>"
-            f"Rects: {latest.get('rect_count')}"
-        )
-    else:
-        status = "<span class='bad'>Картинка ещё не загружена</span>"
+    if port:
+        try:
+            latest = load_latest(clean_port(port))
+            if latest.get("ok"):
+                status = (
+                    f"<span class='ok'>Есть картинка для порта {latest.get('port')}</span><br>"
+                    f"Size: {latest.get('width')}x{latest.get('height')}<br>"
+                    f"Rects: {latest.get('rect_count')}"
+                )
+            else:
+                status = f"<span class='bad'>{latest.get('error')}</span>"
+        except Exception as e:
+            status = f"<span class='bad'>{e}</span>"
 
     return render_template_string(
         HTML,
@@ -285,9 +304,8 @@ def upload():
     if "image" not in request.files:
         return jsonify({"ok": False, "error": "No image file"}), 400
 
-    file = request.files["image"]
-
     try:
+        port = clean_port(request.form.get("port", ""))
         max_w = int(request.form.get("max_w", MAX_W))
         max_h = int(request.form.get("max_h", MAX_H))
         color_step = int(request.form.get("color_step", COLOR_STEP))
@@ -296,18 +314,19 @@ def upload():
         max_h = max(1, min(256, max_h))
         color_step = max(1, min(64, color_step))
 
-        raw = file.read()
+        raw = request.files["image"].read()
         img = Image.open(BytesIO(raw))
 
         data = image_to_rects(img, max_w, max_h, color_step)
-        save_latest(data)
+        save_latest(port, data)
 
         return f"""
         <body style="background:#111;color:white;font-family:Arial;padding:24px">
-            <h2>Uploaded!</h2>
+            <h2>Uploaded to port {port}!</h2>
             <p>Size: {data["width"]}x{data["height"]}</p>
             <p>Rects: {data["rect_count"]}</p>
-            <p><a style="color:#00aaff" href="/">Back</a></p>
+            <p>Now open Roblox script → Image tab → Image Preview / Image Draw.</p>
+            <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
         </body>
         """
 
@@ -317,23 +336,30 @@ def upload():
 
 @app.route("/latest", methods=["GET"])
 def latest():
-    if IMAGE_KEY:
-        key = request.args.get("key", "")
-        if key != IMAGE_KEY:
-            return jsonify({"ok": False, "error": "Bad key"}), 403
-
-    return jsonify(load_latest())
-
-
-@app.route("/clear", methods=["POST"])
-def clear():
-    if not check_key(request):
+    if IMAGE_KEY and not check_key(request):
         return jsonify({"ok": False, "error": "Bad key"}), 403
 
-    if os.path.exists(LATEST_FILE):
-        os.remove(LATEST_FILE)
+    try:
+        port = clean_port(request.args.get("port", ""))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
-    return jsonify({"ok": True, "message": "cleared"})
+    return jsonify(load_latest(port))
+
+
+@app.route("/clear", methods=["POST", "GET"])
+def clear():
+    if IMAGE_KEY and not check_key(request):
+        return jsonify({"ok": False, "error": "Bad key"}), 403
+
+    try:
+        port = clean_port(request.values.get("port", ""))
+        path = port_file(port)
+        if os.path.exists(path):
+            os.remove(path)
+        return jsonify({"ok": True, "message": "cleared", "port": port})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/ping", methods=["GET"])
@@ -341,7 +367,7 @@ def ping():
     return jsonify({
         "ok": True,
         "time": int(time.time()),
-        "service": "babft-image-painter",
+        "service": "babft-image-painter-port",
     })
 
 
