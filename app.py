@@ -34,34 +34,29 @@ HTML = """
         button { background:#00aaff; color:white; font-weight:bold; cursor:pointer; }
         .hint { color:#aaa; font-size:13px; line-height:1.45; }
         code { background:#000; padding:2px 5px; border-radius:4px; }
-        .ok { color:#00ff99; } .bad { color:#ff7777; }
+        .ok { color:#00ff99; }
+        .bad { color:#ff7777; }
     </style>
 </head>
 <body>
 <div class="box">
     <h2>BABFT Image Painter</h2>
     <p class="hint">
-        В Roblox открой вкладку <b>Image</b>, скопируй <b>Port</b> и вставь сюда.
-        Картинка сохранится в этот личный порт. Чёткость/размер потом можно менять прямо в Roblox.
+        В Roblox открой вкладку <b>Image</b>, скопируй <b>Port</b> и вставь его сюда.<br>
+        Здесь нужно только <b>ввести port</b> и <b>выбрать картинку</b>.<br>
+        Размер, чёткость и color step настраиваются уже в самом скрипте.
     </p>
     <form action="/upload" method="post" enctype="multipart/form-data">
         <label>Port из Roblox-скрипта:</label>
         <input name="port" value="{{ port }}" placeholder="Например 54321" required>
 
-        <label>Secret key, если включён IMAGE_KEY:</label>
-        <input name="key" placeholder="Можно оставить пустым">
+        {% if show_key %}
+        <label>Secret key:</label>
+        <input name="key" placeholder="Если используешь IMAGE_KEY">
+        {% endif %}
 
         <label>Картинка:</label>
         <input type="file" name="image" accept="image/*" required>
-
-        <label>Стартовая чёткость: max width</label>
-        <input name="max_w" value="{{ max_w }}">
-
-        <label>Стартовая чёткость: max height</label>
-        <input name="max_h" value="{{ max_h }}">
-
-        <label>Color step: меньше = больше цветов/деталей, но больше блоков</label>
-        <input name="color_step" value="{{ color_step }}">
 
         <button type="submit">Загрузить в этот порт</button>
     </form>
@@ -102,7 +97,7 @@ def check_key(req) -> bool:
     return key == IMAGE_KEY
 
 
-def read_int(name: str, default: int, lo: int, hi: int) -> int:
+def read_int_from_values(name: str, default: int, lo: int, hi: int) -> int:
     raw = request.values.get(name, default)
     try:
         value = int(raw)
@@ -235,13 +230,13 @@ def index():
                     f"<span class='ok'>Есть картинка для порта {latest.get('port')}</span><br>"
                     f"Size: {latest.get('width')}x{latest.get('height')}<br>"
                     f"Rects: {latest.get('rect_count')}<br>"
-                    f"Roblox может менять Res/Color без повторной загрузки."
+                    f"Res/Size/Color меняются уже в Roblox скрипте."
                 )
             else:
                 status = f"<span class='bad'>{latest.get('error')}</span>"
         except Exception as e:
             status = f"<span class='bad'>{e}</span>"
-    return render_template_string(HTML, status=status, port=port, max_w=MAX_W, max_h=MAX_H, color_step=COLOR_STEP)
+    return render_template_string(HTML, status=status, port=port, show_key=bool(IMAGE_KEY))
 
 
 @app.route("/upload", methods=["POST"])
@@ -252,20 +247,18 @@ def upload():
         return jsonify({"ok": False, "error": "No image file"}), 400
     try:
         port = clean_port(request.form.get("port", ""))
-        max_w = read_int("max_w", MAX_W, 1, 256)
-        max_h = read_int("max_h", MAX_H, 1, 256)
-        color_step = read_int("color_step", COLOR_STEP, 1, 64)
         raw = request.files["image"].read()
         save_original(port, raw)
+
         img = Image.open(BytesIO(raw))
-        data = image_to_rects(img, max_w, max_h, color_step)
+        data = image_to_rects(img, MAX_W, MAX_H, COLOR_STEP)
         save_latest(port, data)
+
         return f"""
         <body style="background:#111;color:white;font-family:Arial;padding:24px">
             <h2>Uploaded to port {port}!</h2>
-            <p>Start size: {data['width']}x{data['height']}</p>
-            <p>Rects: {data['rect_count']}</p>
-            <p>В Roblox можно менять Res/Size во вкладке Image.</p>
+            <p>Image saved.</p>
+            <p>Теперь открой Roblox и жми Preview / Draw.</p>
             <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
         </body>
         """
@@ -279,17 +272,24 @@ def latest():
         return jsonify({"ok": False, "error": "Bad key"}), 403
     try:
         port = clean_port(request.args.get("port", ""))
-        max_w = read_int("max_w", MAX_W, 1, 256)
-        max_h = read_int("max_h", MAX_H, 1, 256)
-        color_step = read_int("color_step", COLOR_STEP, 1, 64)
-        data = load_from_original(port, max_w, max_h, color_step)
+        max_w = read_int_from_values("max_w", MAX_W, 1, 256)
+        max_h = read_int_from_values("max_h", MAX_H, 1, 256)
+        color_step = read_int_from_values("color_step", COLOR_STEP, 1, 64)
+
+        data = None
+        try:
+            data = load_from_original(port, max_w, max_h, color_step)
+        except Exception:
+            data = None
+
         if data is None:
             data = load_cached_latest(port)
+
         resp = jsonify(data)
         resp.headers["Cache-Control"] = "no-store, max-age=0"
         return resp
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 
 @app.route("/clear", methods=["POST", "GET"])
@@ -308,7 +308,7 @@ def clear():
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"ok": True, "time": int(time.time()), "service": "babft-image-painter-port-v2"})
+    return jsonify({"ok": True, "time": int(time.time()), "service": "babft-image-painter-port-v3"})
 
 
 if __name__ == "__main__":
