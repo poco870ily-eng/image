@@ -19,9 +19,6 @@ ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_COLOR_STEP = int(os.environ.get("DEFAULT_COLOR_STEP", "16"))
-
-# This is the main anti-500 protection.
-# Do not set it too high on Render Free.
 ABS_MAX_RES = int(os.environ.get("ABS_MAX_RES", "160"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
@@ -31,17 +28,18 @@ os.makedirs(ORIGINAL_DIR, exist_ok=True)
 
 HTML = """
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>BABFT Image Painter</title>
+    <title>Image Painter</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { background:#111; color:white; font-family:Arial,sans-serif; padding:24px; }
-        .box { max-width:760px; margin:auto; background:#1d1d1d; border:1px solid #333; border-radius:12px; padding:18px; }
+        .box { max-width:520px; margin:auto; background:#1d1d1d; border:1px solid #333; border-radius:12px; padding:18px; }
+        h2 { margin-top:0; }
         input, button { width:100%; margin-top:10px; padding:10px; border-radius:8px; border:0; font-size:15px; box-sizing:border-box; }
         button { background:#00aaff; color:white; font-weight:bold; cursor:pointer; }
-        .hint { color:#aaa; font-size:13px; line-height:1.45; }
+        .hint { color:#aaa; font-size:13px; }
         code { background:#000; padding:2px 5px; border-radius:4px; }
         .ok { color:#00ff99; }
         .bad { color:#ff7777; }
@@ -49,33 +47,21 @@ HTML = """
 </head>
 <body>
 <div class="box">
-    <h2>BABFT Image Painter</h2>
-    <p class="hint">
-        В Roblox открой вкладку <b>Image</b>, нажми <b>Copy</b> и вставь Port сюда.<br>
-        На сайте только Port + картинка. Size / Res / Color меняются в Roblox-скрипте.
-    </p>
+    <h2>Image Painter</h2>
 
     <form action="/upload" method="post" enctype="multipart/form-data">
-        <label>Port из Roblox-скрипта:</label>
-        <input name="port" value="{{ port }}" placeholder="Например 54321" required>
+        <input name="port" value="{{ port }}" placeholder="Port" required>
 
         {% if show_key %}
-        <label>Secret key:</label>
-        <input name="key" placeholder="IMAGE_KEY">
+        <input name="key" placeholder="Key">
         {% endif %}
 
-        <label>Картинка:</label>
         <input type="file" name="image" accept="image/*" required>
-
-        <button type="submit">Загрузить в этот порт</button>
+        <button type="submit">Upload</button>
     </form>
 
-    <hr>
     <p>Status: {{ status|safe }}</p>
-    <p class="hint">
-        Проверка: <code>/ping</code><br>
-        Roblox API: <code>/latest?port=PORT&amp;max_w=96&amp;max_h=96&amp;color_step=16</code>
-    </p>
+    <p class="hint"><code>/ping</code> · <code>/latest?port=PORT</code></p>
 </div>
 </body>
 </html>
@@ -95,13 +81,13 @@ def json_error(message: str, status: int = 200, extra: Optional[Dict[str, Any]] 
 @app.errorhandler(Exception)
 def handle_any_exception(e):
     traceback.print_exc()
-    return json_error("server exception: " + str(e), 200)
+    return json_error("Server error: " + str(e), 200)
 
 
 def clean_port(value: str) -> str:
     value = "".join(ch for ch in str(value or "") if ch.isdigit())
     if len(value) < 3:
-        raise ValueError("Bad port: use at least 3 digits")
+        raise ValueError("Bad port")
     return value[:8]
 
 
@@ -182,7 +168,15 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
             while x2 < new_w and grid[y][x2] == color:
                 x2 += 1
 
-            runs.append({"x": x, "y": y, "w": x2 - x, "h": 1, "r": color[0], "g": color[1], "b": color[2]})
+            runs.append({
+                "x": x,
+                "y": y,
+                "w": x2 - x,
+                "h": 1,
+                "r": color[0],
+                "g": color[1],
+                "b": color[2],
+            })
             x = x2
 
     merged = []
@@ -243,8 +237,6 @@ def image_to_rects_safe(img: Image.Image, max_w: int, max_h: int, color_step: in
         if data["rect_count"] <= MAX_RECTS:
             return data
 
-        # Too many rectangles means too much work for Render/Roblox.
-        # First reduce resolution, then reduce colors.
         if max_w > 64 or max_h > 64:
             max_w = max(64, int(max_w * 0.82))
             max_h = max(64, int(max_h * 0.82))
@@ -252,9 +244,9 @@ def image_to_rects_safe(img: Image.Image, max_w: int, max_h: int, color_step: in
             color_step = min(64, color_step * 2)
 
     if last is None:
-        raise RuntimeError("image conversion failed")
+        raise RuntimeError("Conversion failed")
 
-    last["warning"] = "auto reduced; too many rects"
+    last["warning"] = "Auto reduced"
     return last
 
 
@@ -270,7 +262,7 @@ def save_original(port: str, raw: bytes) -> None:
 def load_cached_latest(port: str) -> Dict[str, Any]:
     path = port_file(port)
     if not os.path.exists(path):
-        return {"ok": False, "error": f"No image uploaded for port {port} yet", "port": port}
+        return {"ok": False, "error": "No image", "port": port}
 
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -296,15 +288,15 @@ def load_original_as_rects(port: str, max_w: int, max_h: int, color_step: int) -
 @app.route("/", methods=["GET"])
 def index():
     port = request.args.get("port", "").strip()
-    status = "<span class='bad'>Вставь port из Roblox и загрузи картинку</span>"
+    status = "<span class='bad'>No port</span>"
 
     if port:
         try:
             data = load_cached_latest(clean_port(port))
             if data.get("ok"):
                 status = (
-                    f"<span class='ok'>Есть картинка для порта {data.get('port')}</span><br>"
-                    f"Size: {data.get('width')}x{data.get('height')}<br>"
+                    f"<span class='ok'>Ready: {data.get('port')}</span><br>"
+                    f"{data.get('width')}x{data.get('height')}<br>"
                     f"Rects: {data.get('rect_count')}"
                 )
             else:
@@ -321,28 +313,27 @@ def upload():
         return json_error("Bad key", 403)
 
     if "image" not in request.files:
-        return json_error("No image file", 400)
+        return json_error("No image", 400)
 
     port = clean_port(request.form.get("port", ""))
     raw = request.files["image"].read()
 
     if not raw:
-        return json_error("Empty image file", 400)
+        return json_error("Empty image", 400)
 
     save_original(port, raw)
 
-    # Save a default cached version too, so /latest can fall back if dynamic conversion fails.
     try:
         img = Image.open(BytesIO(raw))
         img.load()
         save_latest(port, image_to_rects_safe(img, DEFAULT_RES, DEFAULT_RES, DEFAULT_COLOR_STEP))
     except Exception as e:
-        return json_error("Upload saved, but image conversion failed: " + str(e), 200, {"port": port})
+        return json_error("Saved, conversion failed: " + str(e), 200, {"port": port})
 
     return f"""
     <body style="background:#111;color:white;font-family:Arial;padding:24px">
-        <h2>Uploaded to port {port}!</h2>
-        <p>Теперь открой Roblox и жми Preview / Draw.</p>
+        <h2>Uploaded</h2>
+        <p>Port: {port}</p>
         <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
     </body>
     """
@@ -362,7 +353,7 @@ def latest():
         data = load_original_as_rects(port, max_w, max_h, color_step)
     except Exception as e:
         data = load_cached_latest(port)
-        data["warning"] = "dynamic conversion failed; returned cached image"
+        data["warning"] = "Cached"
         data["server_error"] = str(e)
 
     if data is None:
@@ -383,7 +374,7 @@ def clear():
         if os.path.exists(path):
             os.remove(path)
 
-    return jsonify({"ok": True, "message": "cleared", "port": port})
+    return jsonify({"ok": True, "message": "Cleared", "port": port})
 
 
 @app.route("/ping", methods=["GET"])
@@ -391,7 +382,7 @@ def ping():
     return jsonify({
         "ok": True,
         "time": int(time.time()),
-        "service": "babft-image-painter-safe-v4",
+        "service": "image-painter-minimal",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
     })
