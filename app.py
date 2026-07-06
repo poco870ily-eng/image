@@ -28,11 +28,11 @@ ABS_MAX_RES = int(os.environ.get("ABS_MAX_RES", "160"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 
-DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", str(min(DEFAULT_RES, 96))))
+DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", str(min(DEFAULT_RES, 64))))
 DEFAULT_VIDEO_FPS = float(os.environ.get("DEFAULT_VIDEO_FPS", "2"))
 MAX_VIDEO_FPS = float(os.environ.get("MAX_VIDEO_FPS", "8"))
-MAX_VIDEO_FRAMES = int(os.environ.get("MAX_VIDEO_FRAMES", "160"))
-VIDEO_MAX_PIXELS = int(os.environ.get("VIDEO_MAX_PIXELS", "9216"))
+MAX_VIDEO_FRAMES = int(os.environ.get("MAX_VIDEO_FRAMES", "80"))
+VIDEO_MAX_PIXELS = int(os.environ.get("VIDEO_MAX_PIXELS", "4096"))
 
 for folder in (DATA_DIR, ORIGINAL_DIR, VIDEO_ORIGINAL_DIR, VIDEO_CACHE_DIR):
     os.makedirs(folder, exist_ok=True)
@@ -898,6 +898,108 @@ def decode_video_frame(port: str, index: int, info: Dict[str, Any], max_w: int, 
     return save_video_frame_cache_from_image(port, index, img, info, max_w, max_h, color_step, fps, max_frames, decoder)
 
 
+
+def decode_video_frames_batch(port: str, indices: List[int], info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> Dict[int, Dict[str, Any]]:
+    """Decode a small batch with one decoder open, so Roblox does not need one HTTP+FFmpeg open per frame."""
+    out: Dict[int, Dict[str, Any]] = {}
+    if info.get("ok") is not True:
+        return out
+    original = find_video_original(port)
+    if not original:
+        return out
+
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
+
+    clean_indices: List[int] = []
+    for idx in indices:
+        idx = int(idx) % frame_count
+        if idx in out:
+            continue
+        cache = video_frame_cache_file(port, idx, max_w, max_h, color_step, fps, max_frames)
+        cached = load_json_file(cache)
+        if cached and cached.get("ok"):
+            out[idx] = cached
+        else:
+            clean_indices.append(idx)
+
+    if not clean_indices:
+        return out
+
+    errors: List[str] = []
+    decoder = str(info.get("decoder") or "")
+
+    try:
+        if decoder == "pillow" or pil_is_animated(original):
+            for idx in clean_indices:
+                img = get_pil_animated_frame(original, idx, fps)
+                out[idx] = save_video_frame_cache_from_image(port, idx, img, info, max_w, max_h, color_step, fps, max_frames, "pillow")
+            return out
+    except Exception as e:
+        errors.append("pillow: " + str(e))
+
+    try:
+        reader = imageio_reader(original)
+        try:
+            try:
+                meta = reader.get_meta_data() or {}
+                source_fps = float(meta.get("fps") or info.get("source_fps") or 30.0)
+            except Exception:
+                source_fps = float(info.get("source_fps") or 30.0)
+            last_img: Optional[Image.Image] = None
+            for idx in clean_indices:
+                source_index = max(0, int(round(float(idx) * source_fps / max(fps, 0.1))))
+                try:
+                    frame = reader.get_data(source_index)
+                    last_img = Image.fromarray(frame).convert("RGBA")
+                except Exception:
+                    if last_img is None:
+                        raise
+                out[idx] = save_video_frame_cache_from_image(port, idx, last_img, info, max_w, max_h, color_step, fps, max_frames, "imageio")
+            return out
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+    except Exception as e:
+        errors.append("imageio: " + str(e))
+
+    try:
+        import cv2  # type: ignore
+        cap = cv2.VideoCapture(original)
+        if not cap.isOpened():
+            raise RuntimeError("cv2 could not open video")
+        try:
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS) or info.get("source_fps") or 30.0)
+            last_img = None
+            for idx in clean_indices:
+                source_index = max(0, int(round(float(idx) * source_fps / max(fps, 0.1))))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, source_index)
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    last_img = Image.fromarray(frame).convert("RGBA")
+                elif last_img is None:
+                    raise RuntimeError("cv2 could not read frame " + str(source_index))
+                out[idx] = save_video_frame_cache_from_image(port, idx, last_img, info, max_w, max_h, color_step, fps, max_frames, "cv2")
+            return out
+        finally:
+            cap.release()
+    except Exception as e:
+        errors.append("cv2: " + str(e))
+
+    # Last safe fallback: decode one-by-one. It is slower, but should return a JSON error instead of 502.
+    for idx in clean_indices:
+        try:
+            out[idx] = decode_video_frame(port, idx, info, max_w, max_h, color_step, fps, max_frames)
+        except Exception as e:
+            out[idx] = {"ok": False, "type": "video_frame", "port": clean_port(port), "index": idx, "error": "batch decode failed: " + str(e) + " | " + " | ".join(errors[:2])}
+    return out
+
 def video_frame_response(current: Dict[str, Any], previous: Optional[Dict[str, Any]], prev_index: Optional[int]) -> Dict[str, Any]:
     if current.get("ok") is not True:
         current["type"] = "video_frame"
@@ -1084,6 +1186,9 @@ def video_meta():
 
 @app.route("/video/prepare", methods=["GET", "POST"])
 def video_prepare():
+    # IMPORTANT: Render free instances can crash/502 if we decode/cache the whole video
+    # in one background job. This endpoint is now only a lightweight status endpoint.
+    # Roblox uses /video/frames to pull tiny batches instead.
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
     port = clean_port(request.values.get("port", ""))
@@ -1092,8 +1197,24 @@ def video_prepare():
     color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
     fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
     max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
-    force = str(request.values.get("force", "0")).lower() in ("1", "true", "yes")
-    return json_response(start_video_prepare_job(port, max_w, max_h, color_step, fps, max_frames, force))
+    info = get_video_info(port, max_w, max_h, color_step, fps, max_frames)
+    if info.get("ok") is not True:
+        return json_response({"ok": False, "type": "video_prepare", "port": port, "error": info.get("error", "Video not ready")})
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    cached = count_cached_video_frames(port, frame_count, *clamp_video_size(max_w, max_h), max(4, min(64, int(color_step))), max(0.25, min(MAX_VIDEO_FPS, float(fps))), max(1, min(MAX_VIDEO_FRAMES, int(max_frames))))
+    return json_response({
+        "ok": True,
+        "type": "video_prepare",
+        "port": port,
+        "ready": False,
+        "status": "streaming",
+        "cached": cached,
+        "frame_count": frame_count,
+        "fps": info.get("fps", fps),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "message": "Whole-video prepare is disabled to prevent Render 502/503. Use /video/frames streaming.",
+    })
 
 
 @app.route("/video/frame", methods=["GET"])
@@ -1124,6 +1245,64 @@ def video_frame():
     return json_response(video_frame_response(current, previous, prev))
 
 
+
+@app.route("/video/frames", methods=["GET"])
+def video_frames():
+    if IMAGE_KEY and not check_key(request):
+        return json_error("Bad key", 403)
+    port = clean_port(request.args.get("port", ""))
+    max_w = read_int("max_w", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
+    max_h = read_int("max_h", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
+    color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
+    fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
+    max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
+    start = read_int("start", 0, 0, 1000000)
+    count = read_int("count", 2, 1, 3)  # tiny batches only: protects Render from 502/503
+    prev_arg = request.args.get("prev")
+    try:
+        prev = None if prev_arg in (None, "", "nil", "none") else int(prev_arg)
+    except Exception:
+        prev = None
+
+    info = get_video_info(port, max_w, max_h, color_step, fps, max_frames)
+    if info.get("ok") is not True:
+        return json_response({"ok": False, "type": "video_frames", "port": port, "error": info.get("error", "Video not ready")})
+
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    indices = [(start + i) % frame_count for i in range(count)]
+    needed = list(indices)
+    if prev is not None and prev >= 0:
+        needed.insert(0, prev % frame_count)
+
+    decoded = decode_video_frames_batch(port, needed, info, max_w, max_h, color_step, fps, max_frames)
+    frames: List[Dict[str, Any]] = []
+    previous = decoded.get(prev % frame_count) if prev is not None and prev >= 0 else None
+    prev_index = prev
+
+    for idx in indices:
+        current = decoded.get(idx)
+        if not current:
+            current = decode_video_frame(port, idx, info, max_w, max_h, color_step, fps, max_frames)
+        response = video_frame_response(current, previous, prev_index)
+        frames.append(response)
+        if current.get("ok"):
+            previous = current
+            prev_index = idx
+
+    return json_response({
+        "ok": True,
+        "type": "video_frames",
+        "port": port,
+        "start": start,
+        "count": len(frames),
+        "frame_count": frame_count,
+        "fps": info.get("fps", fps),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "streaming": True,
+        "frames": frames,
+    })
+
 @app.route("/clear", methods=["POST", "GET"])
 def clear():
     if IMAGE_KEY and not check_key(request):
@@ -1146,13 +1325,14 @@ def ping():
     return json_response({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-painter-fast-2fps-skip-fixed",
+        "service": "image-video-painter-stream-no502",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
         "video": True,
-        "lazy_video": False,
-        "video_prepare_cache": True,
+        "lazy_video": True,
+        "video_prepare_cache": False,
         "server_diff_skip": True,
+        "batch_streaming": True,
         "default_video_fps": DEFAULT_VIDEO_FPS,
         "max_video_fps": MAX_VIDEO_FPS,
         "max_video_frames": MAX_VIDEO_FRAMES,
