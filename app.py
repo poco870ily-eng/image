@@ -4,6 +4,7 @@ import json
 import math
 import time
 import traceback
+import threading
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,10 @@ VIDEO_MAX_PIXELS = int(os.environ.get("VIDEO_MAX_PIXELS", "9216"))
 
 for folder in (DATA_DIR, ORIGINAL_DIR, VIDEO_ORIGINAL_DIR, VIDEO_CACHE_DIR):
     os.makedirs(folder, exist_ok=True)
+
+VIDEO_PREPARE_LOCK = threading.Lock()
+VIDEO_PREPARE_JOBS: Dict[str, Dict[str, Any]] = {}
+
 
 HTML = """
 <!doctype html>
@@ -79,7 +84,7 @@ HTML = """
     <p class="hint">
         Image: <code>/latest?port=PORT</code><br>
         Video: <code>/video/meta?port=PORT</code> · <code>/video/frame?port=PORT&amp;index=0</code><br>
-        Upload is instant now. Frames are decoded lazily when the Roblox script asks for them.
+        Upload is instant now. Frames are prepared/cached before playback, then Roblox gets fast diff frames.
     </p>
 </div>
 </body>
@@ -154,6 +159,21 @@ def video_frame_cache_file(port: str, index: int, max_w: int, max_h: int, color_
         VIDEO_CACHE_DIR,
         f"{clean_port(port)}_{int(max_w)}x{int(max_h)}_c{int(color_step)}_f{fps_token}_m{int(max_frames)}_i{int(index)}.json",
     )
+
+
+def video_cache_job_key(port: str, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> str:
+    fps_token = clean_token(str(round(float(fps), 3)).replace(".", "p"), "2")
+    return f"{clean_port(port)}_{int(max_w)}x{int(max_h)}_c{int(color_step)}_f{fps_token}_m{int(max_frames)}"
+
+
+def count_cached_video_frames(port: str, frame_count: int, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> int:
+    total = max(0, int(frame_count or 0))
+    ready = 0
+    for i in range(total):
+        path = video_frame_cache_file(port, i, max_w, max_h, color_step, fps, max_frames)
+        if os.path.exists(path):
+            ready += 1
+    return ready
 
 
 def atomic_write(path: str, data: bytes) -> None:
@@ -594,6 +614,211 @@ def get_video_info(port: str, max_w: int, max_h: int, color_step: int, fps: floa
     }
 
 
+def save_video_frame_cache_from_image(port: str, index: int, img: Image.Image, info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int, decoder: str) -> Dict[str, Any]:
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    index = int(index) % frame_count
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
+    cache = video_frame_cache_file(port, index, max_w, max_h, color_step, fps, max_frames)
+    cached = load_json_file(cache)
+    if cached and cached.get("ok"):
+        return cached
+    return save_video_frame_cache_from_image(port, index, img, info, max_w, max_h, color_step, fps, max_frames, decoder)
+
+
+def prepare_video_frames_to_cache(port: str, info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int, progress_cb=None) -> Dict[str, Any]:
+    original = find_video_original(port)
+    if not original:
+        raise RuntimeError("No video")
+
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
+    decoder = str(info.get("decoder") or "")
+
+    if progress_cb:
+        progress_cb(0, frame_count, "starting")
+
+    # Animated GIF/WebP/APNG. Pillow is reliable, but each sampled frame can be slow for huge GIFs;
+    # cached output still makes playback fast after this prepare step.
+    if decoder == "pillow" or pil_is_animated(original):
+        for i in range(frame_count):
+            img = get_pil_animated_frame(original, i, fps)
+            save_video_frame_cache_from_image(port, i, img, info, max_w, max_h, color_step, fps, max_frames, "pillow")
+            if progress_cb:
+                progress_cb(i + 1, frame_count, "pillow")
+        return {"decoder": "pillow", "frame_count": frame_count}
+
+    errors: List[str] = []
+
+    # Normal MP4/WebM/MOV. Keep one reader open while preparing all sampled frames.
+    try:
+        reader = imageio_reader(original)
+        try:
+            try:
+                meta = reader.get_meta_data() or {}
+                source_fps = float(meta.get("fps") or info.get("source_fps") or 30.0)
+            except Exception:
+                source_fps = float(info.get("source_fps") or 30.0)
+            last_img: Optional[Image.Image] = None
+            for i in range(frame_count):
+                source_index = max(0, int(round(float(i) * source_fps / max(fps, 0.1))))
+                try:
+                    frame = reader.get_data(source_index)
+                    last_img = Image.fromarray(frame).convert("RGBA")
+                except Exception:
+                    if last_img is None:
+                        raise
+                save_video_frame_cache_from_image(port, i, last_img, info, max_w, max_h, color_step, fps, max_frames, "imageio")
+                if progress_cb:
+                    progress_cb(i + 1, frame_count, "imageio")
+            return {"decoder": "imageio", "frame_count": frame_count}
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+    except Exception as e:
+        errors.append("imageio: " + str(e))
+
+    # Fallback for hosts where OpenCV is installed instead.
+    try:
+        import cv2  # type: ignore
+        cap = cv2.VideoCapture(original)
+        if not cap.isOpened():
+            raise RuntimeError("cv2 could not open video")
+        try:
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS) or info.get("source_fps") or 30.0)
+            last_img = None
+            for i in range(frame_count):
+                source_index = max(0, int(round(float(i) * source_fps / max(fps, 0.1))))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, source_index)
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    last_img = Image.fromarray(frame).convert("RGBA")
+                elif last_img is None:
+                    raise RuntimeError("cv2 could not read frame " + str(source_index))
+                save_video_frame_cache_from_image(port, i, last_img, info, max_w, max_h, color_step, fps, max_frames, "cv2")
+                if progress_cb:
+                    progress_cb(i + 1, frame_count, "cv2")
+            return {"decoder": "cv2", "frame_count": frame_count}
+        finally:
+            cap.release()
+    except Exception as e:
+        errors.append("cv2: " + str(e))
+
+    raise RuntimeError("Could not prepare video: " + " | ".join(errors[:3]))
+
+
+def start_video_prepare_job(port: str, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int, force: bool = False) -> Dict[str, Any]:
+    port = clean_port(port)
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
+    info = get_video_info(port, max_w, max_h, color_step, fps, max_frames)
+    if info.get("ok") is not True:
+        return {"ok": False, "type": "video_prepare", "port": port, "error": info.get("error", "Video not ready")}
+
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    key = video_cache_job_key(port, max_w, max_h, color_step, fps, max_frames)
+
+    if force:
+        for path in glob.glob(os.path.join(VIDEO_CACHE_DIR, f"{key}_i*.json")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    cached = count_cached_video_frames(port, frame_count, max_w, max_h, color_step, fps, max_frames)
+    if cached >= frame_count and not force:
+        return {
+            "ok": True,
+            "type": "video_prepare",
+            "port": port,
+            "ready": True,
+            "status": "ready",
+            "cached": cached,
+            "frame_count": frame_count,
+            "fps": fps,
+            "width": info.get("width"),
+            "height": info.get("height"),
+        }
+
+    with VIDEO_PREPARE_LOCK:
+        job = VIDEO_PREPARE_JOBS.get(key)
+        if job and job.get("status") in ("starting", "running"):
+            return dict(job)
+
+        job = {
+            "ok": True,
+            "type": "video_prepare",
+            "port": port,
+            "ready": False,
+            "status": "starting",
+            "cached": cached,
+            "frame_count": frame_count,
+            "fps": fps,
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "started_at": int(time.time()),
+        }
+        VIDEO_PREPARE_JOBS[key] = job
+
+    def worker():
+        def progress(done: int, total: int, decoder_name: str):
+            with VIDEO_PREPARE_LOCK:
+                current = VIDEO_PREPARE_JOBS.get(key, job)
+                current.update({
+                    "ok": True,
+                    "type": "video_prepare",
+                    "port": port,
+                    "ready": done >= total,
+                    "status": "ready" if done >= total else "running",
+                    "cached": done,
+                    "frame_count": total,
+                    "decoder": decoder_name,
+                    "updated_at": int(time.time()),
+                })
+
+        try:
+            progress(cached, frame_count, str(info.get("decoder") or ""))
+            result = prepare_video_frames_to_cache(port, info, max_w, max_h, color_step, fps, max_frames, progress)
+            final_cached = count_cached_video_frames(port, frame_count, max_w, max_h, color_step, fps, max_frames)
+            with VIDEO_PREPARE_LOCK:
+                VIDEO_PREPARE_JOBS[key].update({
+                    "ok": True,
+                    "ready": final_cached >= frame_count,
+                    "status": "ready" if final_cached >= frame_count else "partial",
+                    "cached": final_cached,
+                    "frame_count": frame_count,
+                    "decoder": result.get("decoder"),
+                    "finished_at": int(time.time()),
+                })
+        except Exception as e:
+            traceback.print_exc()
+            with VIDEO_PREPARE_LOCK:
+                VIDEO_PREPARE_JOBS[key].update({
+                    "ok": False,
+                    "ready": False,
+                    "status": "error",
+                    "error": str(e),
+                    "trace": traceback.format_exc()[-1200:],
+                    "updated_at": int(time.time()),
+                })
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    with VIDEO_PREPARE_LOCK:
+        return dict(VIDEO_PREPARE_JOBS[key])
+
+
 def decode_video_frame(port: str, index: int, info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> Dict[str, Any]:
     if info.get("ok") is not True:
         return info
@@ -649,24 +874,7 @@ def decode_video_frame(port: str, index: int, info: Dict[str, Any], max_w: int, 
             "error": "Could not decode frame: " + " | ".join(errors[:3]),
         }
 
-    target = (int(info.get("width") or 0), int(info.get("height") or 0))
-    w, h, pixels = frame_to_hex_pixels(img, max_w, max_h, color_step, target if target[0] > 0 and target[1] > 0 else None)
-    data = {
-        "ok": True,
-        "type": "video_frame_cache",
-        "port": clean_port(port),
-        "index": index,
-        "width": w,
-        "height": h,
-        "fps": fps,
-        "frame_count": frame_count,
-        "pixel_count": w * h,
-        "color_step": color_step,
-        "decoder": decoder,
-        "pixels": pixels,
-    }
-    atomic_write_json(cache, data)
-    return data
+    return save_video_frame_cache_from_image(port, index, img, info, max_w, max_h, color_step, fps, max_frames, decoder)
 
 
 def video_frame_response(current: Dict[str, Any], previous: Optional[Dict[str, Any]], prev_index: Optional[int]) -> Dict[str, Any]:
@@ -687,6 +895,8 @@ def video_frame_response(current: Dict[str, Any], previous: Optional[Dict[str, A
         "index": current.get("index"),
         "pixel_count": total_pixels,
         "color_step": current.get("color_step"),
+        "skip_unchanged": True,
+        "diff": previous is not None and previous.get("ok") is True,
     }
 
     if previous is None or previous.get("ok") is not True or int(previous.get("index") or -1) != int(prev_index if prev_index is not None else -2):
@@ -794,7 +1004,7 @@ def upload():
             <h2>Video saved</h2>
             <p>Port: {port}</p>
             <p>Now open Roblox script and press <b>video preview</b> or <b>build canvas</b>.</p>
-            <p>Frames will be decoded lazily, so upload should not crash Render.</p>
+            <p>Frames will be prepared/cached before playback, so FPS is much faster.</p>
             <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
         </body>
         """
@@ -851,6 +1061,20 @@ def video_meta():
     return json_response(data)
 
 
+@app.route("/video/prepare", methods=["GET", "POST"])
+def video_prepare():
+    if IMAGE_KEY and not check_key(request):
+        return json_error("Bad key", 403)
+    port = clean_port(request.values.get("port", ""))
+    max_w = read_int("max_w", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
+    max_h = read_int("max_h", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
+    color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
+    fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
+    max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
+    force = str(request.values.get("force", "0")).lower() in ("1", "true", "yes")
+    return json_response(start_video_prepare_job(port, max_w, max_h, color_step, fps, max_frames, force))
+
+
 @app.route("/video/frame", methods=["GET"])
 def video_frame():
     if IMAGE_KEY and not check_key(request):
@@ -901,11 +1125,13 @@ def ping():
     return json_response({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-painter-lazy-no500",
+        "service": "image-video-painter-fast-2fps-skip",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
         "video": True,
-        "lazy_video": True,
+        "lazy_video": False,
+        "video_prepare_cache": True,
+        "server_diff_skip": True,
         "default_video_fps": DEFAULT_VIDEO_FPS,
         "max_video_fps": MAX_VIDEO_FPS,
         "max_video_frames": MAX_VIDEO_FRAMES,
