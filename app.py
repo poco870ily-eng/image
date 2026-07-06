@@ -416,7 +416,13 @@ def extract_frames_from_animated_pil(raw: bytes, fps: float, max_frames: int) ->
 def extract_frames_with_imageio(path: str, fps: float, max_frames: int) -> List[Image.Image]:
     import imageio.v2 as imageio  # type: ignore
 
-    reader = imageio.get_reader(path)
+    try:
+        reader = imageio.get_reader(path, format="FFMPEG")
+    except TypeError:
+        reader = imageio.get_reader(path)
+    except Exception:
+        reader = imageio.get_reader(path)
+
     try:
         meta = reader.get_meta_data() or {}
         source_fps = float(meta.get("fps") or 0)
