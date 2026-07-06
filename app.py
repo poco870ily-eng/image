@@ -1257,7 +1257,7 @@ def video_frames():
     fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
     max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
     start = read_int("start", 0, 0, 1000000)
-    count = read_int("count", 2, 1, 3)  # tiny batches only: protects Render from 502/503
+    count = read_int("count", 3, 1, 4)  # buffered client asks ahead; keep batches small enough for Render
     prev_arg = request.args.get("prev")
     try:
         prev = None if prev_arg in (None, "", "nil", "none") else int(prev_arg)
@@ -1325,7 +1325,7 @@ def ping():
     return json_response({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-painter-stream-no502",
+        "service": "image-video-painter-buffered-even-playback",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
         "video": True,
@@ -1333,6 +1333,8 @@ def ping():
         "video_prepare_cache": False,
         "server_diff_skip": True,
         "batch_streaming": True,
+        "buffered_even_playback": True,
+        "video_frames_batch_max": 4,
         "default_video_fps": DEFAULT_VIDEO_FPS,
         "max_video_fps": MAX_VIDEO_FPS,
         "max_video_frames": MAX_VIDEO_FRAMES,
