@@ -621,11 +621,32 @@ def save_video_frame_cache_from_image(port: str, index: int, img: Image.Image, i
     fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
     max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
     color_step = max(4, min(64, int(color_step)))
+
     cache = video_frame_cache_file(port, index, max_w, max_h, color_step, fps, max_frames)
     cached = load_json_file(cache)
     if cached and cached.get("ok"):
         return cached
-    return save_video_frame_cache_from_image(port, index, img, info, max_w, max_h, color_step, fps, max_frames, decoder)
+
+    target = (int(info.get("width") or 0), int(info.get("height") or 0))
+    target = target if target[0] > 0 and target[1] > 0 else None
+    w, h, pixels = frame_to_hex_pixels(img, max_w, max_h, color_step, target)
+
+    data = {
+        "ok": True,
+        "type": "video_frame_cache",
+        "port": clean_port(port),
+        "index": index,
+        "width": w,
+        "height": h,
+        "fps": fps,
+        "frame_count": frame_count,
+        "pixel_count": w * h,
+        "color_step": color_step,
+        "decoder": decoder,
+        "pixels": pixels,
+    }
+    atomic_write_json(cache, data)
+    return data
 
 
 def prepare_video_frames_to_cache(port: str, info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int, progress_cb=None) -> Dict[str, Any]:
@@ -1125,7 +1146,7 @@ def ping():
     return json_response({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-painter-fast-2fps-skip",
+        "service": "image-video-painter-fast-2fps-skip-fixed",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
         "video": True,
