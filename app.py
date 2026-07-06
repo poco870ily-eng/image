@@ -1,11 +1,11 @@
-import os
 import json
+import os
 import time
 import traceback
 from io import BytesIO
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -17,6 +17,7 @@ IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
 VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
+IMAGE_SETTINGS_DIR = os.environ.get("IMAGE_SETTINGS_DIR", "image_settings")
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -28,11 +29,10 @@ VIDEO_MAX_CHUNK_FRAMES = int(os.environ.get("VIDEO_MAX_CHUNK_FRAMES", "12"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(ORIGINAL_DIR, exist_ok=True)
-os.makedirs(VIDEO_DIR, exist_ok=True)
+for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR):
+    os.makedirs(path, exist_ok=True)
 
-HTML = r"""
+HTML = r'''
 <!doctype html>
 <html lang="en">
 <head>
@@ -41,125 +41,204 @@ HTML = r"""
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         :root { color-scheme: dark; }
-        body { background:#0d0d10; color:white; font-family:Arial,sans-serif; padding:24px; }
-        .box { max-width:720px; margin:auto; background:#18181c; border:1px solid #303038; border-radius:14px; padding:18px; }
-        h2 { margin:0 0 12px; }
-        h3 { margin:22px 0 8px; font-size:16px; }
-        input, button, select { width:100%; margin-top:10px; padding:10px; border-radius:9px; border:1px solid #34343d; background:#0d0d10; color:white; font-size:15px; box-sizing:border-box; }
-        button { background:#0984ff; border:0; color:white; font-weight:bold; cursor:pointer; }
-        button:disabled { opacity:.55; cursor:not-allowed; }
-        .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-        .hint { color:#aaa; font-size:13px; line-height:1.35; }
-        code { background:#000; padding:2px 5px; border-radius:4px; }
-        .ok { color:#00ff99; }
-        .bad { color:#ff7777; }
-        .warn { color:#ffd36a; }
-        .bar { height:10px; background:#09090b; border-radius:999px; overflow:hidden; border:1px solid #303038; margin-top:12px; }
-        .fill { height:100%; width:0%; background:#00aaff; transition:width .15s linear; }
-        canvas { display:none; }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #0c0c10; color: #f4f4f7; font-family: Arial, sans-serif; }
+        .wrap { max-width: 860px; margin: 0 auto; padding: 22px; }
+        .box { background: #17171d; border: 1px solid #2d2d36; border-radius: 16px; padding: 18px; }
+        h1 { font-size: 24px; margin: 0 0 18px; }
+        h2 { font-size: 18px; margin: 0 0 12px; }
+        .section { margin-top: 18px; padding-top: 18px; border-top: 1px solid #2a2a33; }
+        .section:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+        @media (max-width: 720px) {
+            .grid2, .grid4 { grid-template-columns: 1fr; }
+        }
+        label { display: block; font-size: 13px; color: #b7b7c4; margin: 10px 0 6px; }
+        input, button { width: 100%; border-radius: 10px; border: 1px solid #333441; background: #0e0e14; color: #fff; padding: 11px 12px; font-size: 14px; }
+        input[type=file] { padding: 9px 10px; }
+        button { cursor: pointer; border: 0; background: #1388ff; font-weight: 700; }
+        button.secondary { background: #262833; }
+        button:disabled { opacity: .58; cursor: not-allowed; }
+        .hint { margin-top: 6px; font-size: 12px; color: #9898a7; line-height: 1.45; }
+        .status { margin-top: 12px; min-height: 20px; font-size: 13px; color: #d8d8e2; white-space: pre-wrap; }
+        .ok { color: #77f2a7; }
+        .bad { color: #ff8d8d; }
+        .bar { margin-top: 12px; height: 10px; background: #0c0c12; border: 1px solid #2f3040; border-radius: 999px; overflow: hidden; }
+        .fill { height: 100%; width: 0%; background: linear-gradient(90deg, #1388ff, #1cb8ff); transition: width .12s linear; }
+        .topline { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }
+        @media (max-width: 720px) { .topline { grid-template-columns: 1fr; } }
+        .mini { margin-top: 8px; font-size: 12px; color: #a9a9b8; }
     </style>
 </head>
 <body>
-<div class="box">
-    <h2>Image / Video Painter</h2>
+<div class="wrap">
+    <div class="box">
+        <h1>Image / Video Painter</h1>
 
-    <h3>Image upload</h3>
-    <form action="/upload" method="post" enctype="multipart/form-data">
-        <input name="port" value="{{ port }}" placeholder="Port" required>
-        {% if show_key %}<input name="key" placeholder="Key">{% endif %}
-        <input type="file" name="image" accept="image/*" required>
-        <button type="submit">Upload image</button>
-    </form>
+        <div class="topline">
+            <div>
+                <label for="sharedPort">Port</label>
+                <input id="sharedPort" value="{{ port }}" placeholder="Port">
+            </div>
+            {% if show_key %}
+            <div>
+                <label for="sharedKey">Key</label>
+                <input id="sharedKey" placeholder="Key">
+            </div>
+            {% endif %}
+        </div>
 
-    <h3>Video upload</h3>
-    <p class="hint">
-        Video is converted in your browser, not on Render. This avoids 502/503 and makes Roblox playback smoother.
-        Recommended: <code>64</code> res, <code>2</code> FPS, <code>40-80</code> frames.
-    </p>
-    <input id="vPort" value="{{ port }}" placeholder="Port" required>
-    {% if show_key %}<input id="vKey" placeholder="Key">{% endif %}
-    <input id="vFile" type="file" accept="video/*,.gif,.webp,.apng">
-    <div class="row">
-        <input id="vRes" type="number" min="16" max="96" value="64" placeholder="Resolution">
-        <input id="vFps" type="number" min="0.25" max="8" step="0.25" value="2" placeholder="FPS">
+        <div class="section">
+            <h2>Image</h2>
+            <div class="grid2">
+                <div>
+                    <label for="imgFile">Choose image</label>
+                    <input id="imgFile" type="file" accept="image/*">
+                </div>
+                <div>
+                    <label>&nbsp;</label>
+                    <button id="imgUploadBtn" type="button">Upload image</button>
+                </div>
+            </div>
+            <div class="grid2">
+                <div>
+                    <label for="imgRes">Image resolution</label>
+                    <input id="imgRes" type="number" min="8" max="{{ abs_max_res }}" value="96">
+                    <div class="hint">Bigger value = more detail and more blocks.</div>
+                </div>
+                <div>
+                    <label for="imgStep">Image color step</label>
+                    <input id="imgStep" type="number" min="4" max="64" value="16">
+                    <div class="hint">Smaller value = more accurate colors.</div>
+                </div>
+            </div>
+            <div id="imgStatus" class="status">Choose an image, upload it once, then changing image settings updates it automatically.</div>
+        </div>
+
+        <div class="section">
+            <h2>Video</h2>
+            <div class="grid2">
+                <div>
+                    <label for="vidFile">Choose video</label>
+                    <input id="vidFile" type="file" accept="video/*,.gif,.webp,.apng">
+                </div>
+                <div>
+                    <label>&nbsp;</label>
+                    <button id="videoConvertBtn" type="button">Convert video</button>
+                </div>
+            </div>
+            <div class="grid4">
+                <div>
+                    <label for="vidRes">Video resolution</label>
+                    <input id="vidRes" type="number" min="16" max="{{ video_max_res }}" value="64">
+                    <div class="hint">Smaller value = smoother playback.</div>
+                </div>
+                <div>
+                    <label for="vidFps">Video FPS</label>
+                    <input id="vidFps" type="number" min="0.25" max="8" step="0.25" value="2">
+                    <div class="hint">How many frames are saved per second.</div>
+                </div>
+                <div>
+                    <label for="vidFrames">Max frames</label>
+                    <input id="vidFrames" type="number" min="1" max="{{ video_max_frames }}" value="60">
+                    <div class="hint">Total frames to keep from the video.</div>
+                </div>
+                <div>
+                    <label for="vidStep">Video color step</label>
+                    <input id="vidStep" type="number" min="4" max="64" value="16">
+                    <div class="hint">Smaller value = more accurate colors.</div>
+                </div>
+            </div>
+            <div class="bar"><div id="videoFill" class="fill"></div></div>
+            <div id="videoStatus" class="status">Choose a video. Changing video settings automatically rebuilds the current selected video.</div>
+            <div class="mini" id="pageStatus"></div>
+        </div>
     </div>
-    <div class="row">
-        <input id="vFrames" type="number" min="1" max="120" value="60" placeholder="Max frames">
-        <input id="vStep" type="number" min="4" max="64" value="16" placeholder="Color step">
-    </div>
-    <button id="convertBtn" type="button">Convert video in browser</button>
-    <div class="bar"><div id="progressFill" class="fill"></div></div>
-    <p id="videoStatus" class="hint">Waiting for video.</p>
-
-    <p>Status: {{ status|safe }}</p>
-    <p class="hint"><code>/ping</code> · <code>/latest?port=PORT</code> · <code>/video/meta?port=PORT</code></p>
 </div>
 
-<video id="video" muted playsinline preload="auto" style="display:none"></video>
-<canvas id="canvas"></canvas>
+<video id="hiddenVideo" muted playsinline preload="auto" style="display:none"></video>
+<canvas id="hiddenCanvas" style="display:none"></canvas>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const statusEl = $("videoStatus");
-const fillEl = $("progressFill");
+const $ = id => document.getElementById(id);
+const state = {
+    imageUploaded: false,
+    videoConverted: false,
+    imageSettingsTimer: null,
+    videoSettingsTimer: null,
+    busyImage: false,
+    busyVideo: false,
+};
 
 function cleanPort(v) {
-    const p = String(v || "").replace(/\D+/g, "").slice(0, 8);
-    if (p.length < 3) throw new Error("Bad port");
+    const p = String(v || '').replace(/\D+/g, '').slice(0, 8);
+    if (p.length < 3) throw new Error('Bad port');
     return p;
+}
+function getKey() {
+    const el = $('sharedKey');
+    return el ? String(el.value || '') : '';
 }
 function clamp(n, lo, hi, d) {
     n = Number(n);
     if (!Number.isFinite(n)) n = d;
     return Math.max(lo, Math.min(hi, n));
 }
-function q(v, step) {
-    return Math.max(0, Math.min(255, Math.round(v / step) * step));
-}
-function hex2(r,g,b) {
-    return [r,g,b].map(v => Math.max(0, Math.min(255, v|0)).toString(16).padStart(2,"0")).join("").toUpperCase();
-}
-function setProgress(done, total, text) {
+function setVideoProgress(done, total, text) {
     const pct = total > 0 ? Math.max(0, Math.min(100, Math.round(done / total * 100))) : 0;
-    fillEl.style.width = pct + "%";
-    statusEl.textContent = text || (pct + "%");
+    $('videoFill').style.width = pct + '%';
+    if (text) $('videoStatus').textContent = text;
+}
+async function parseJson(res) {
+    const text = await res.text();
+    try { return JSON.parse(text); }
+    catch (e) { throw new Error(text.slice(0, 220) || 'Bad JSON'); }
 }
 async function postJSON(url, data) {
     const res = await fetch(url, {
-        method: "POST",
-        headers: {"Content-Type":"application/json", "Accept":"application/json"},
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(data)
     });
-    const text = await res.text();
-    let json;
-    try { json = JSON.parse(text); } catch (e) { throw new Error("Bad server body: " + text.slice(0, 180)); }
-    if (!json.ok) throw new Error(json.error || "Server error");
+    const json = await parseJson(res);
+    if (!json.ok) throw new Error(json.error || 'Request failed');
     return json;
 }
-function waitEvent(el, name, timeoutMs) {
+function debounce(fn, key, delay) {
+    clearTimeout(state[key]);
+    state[key] = setTimeout(fn, delay);
+}
+function q(v, step) {
+    return Math.max(0, Math.min(255, Math.round(v / step) * step));
+}
+function hex2(r, g, b) {
+    return [r, g, b].map(v => Math.max(0, Math.min(255, v|0)).toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+async function waitEvent(el, name, timeoutMs) {
     return new Promise((resolve, reject) => {
         let done = false;
         const timer = setTimeout(() => {
             if (done) return;
             done = true;
             cleanup();
-            reject(new Error("Timeout waiting for " + name));
+            reject(new Error('Timeout waiting for ' + name));
         }, timeoutMs || 12000);
         function cleanup() {
             clearTimeout(timer);
             el.removeEventListener(name, ok);
-            el.removeEventListener("error", bad);
+            el.removeEventListener('error', bad);
         }
         function ok() { if (done) return; done = true; cleanup(); resolve(); }
-        function bad() { if (done) return; done = true; cleanup(); reject(new Error("Video decode error")); }
-        el.addEventListener(name, ok, {once:true});
-        el.addEventListener("error", bad, {once:true});
+        function bad() { if (done) return; done = true; cleanup(); reject(new Error('Video decode error')); }
+        el.addEventListener(name, ok, { once: true });
+        el.addEventListener('error', bad, { once: true });
     });
 }
 async function seekVideo(video, t) {
     const safeT = Math.max(0, Math.min((video.duration || 0) - 0.035, t));
     if (Math.abs(video.currentTime - safeT) < 0.015) return;
-    const p = waitEvent(video, "seeked", 15000);
+    const p = waitEvent(video, 'seeked', 15000);
     video.currentTime = safeT;
     await p;
 }
@@ -172,94 +251,209 @@ function frameToHexes(ctx, w, h, colorStep) {
     return hexes;
 }
 
-$("convertBtn").onclick = async () => {
-    const btn = $("convertBtn");
-    btn.disabled = true;
+function imageSettingsPayload() {
+    return {
+        port: cleanPort($('sharedPort').value),
+        key: getKey(),
+        max_side: Math.floor(clamp($('imgRes').value, 8, {{ abs_max_res }}, 96)),
+        color_step: Math.floor(clamp($('imgStep').value, 4, 64, 16))
+    };
+}
+
+async function reprocessImageSettings() {
+    if (state.busyImage) return;
+    try {
+        state.busyImage = true;
+        $('imgStatus').textContent = 'Updating image settings...';
+        const data = await postJSON('/image/settings', imageSettingsPayload());
+        state.imageUploaded = !!data.image_ready;
+        $('imgStatus').textContent = data.summary || ('Image updated: ' + data.port);
+    } catch (e) {
+        $('imgStatus').textContent = 'Image error: ' + (e && e.message ? e.message : e);
+    } finally {
+        state.busyImage = false;
+    }
+}
+
+$('imgUploadBtn').onclick = async () => {
+    if (state.busyImage) return;
+    const file = $('imgFile').files[0];
+    if (!file) {
+        $('imgStatus').textContent = 'Choose an image first.';
+        return;
+    }
+    try {
+        state.busyImage = true;
+        $('imgStatus').textContent = 'Uploading image...';
+        const fd = new FormData();
+        const cfg = imageSettingsPayload();
+        fd.append('port', cfg.port);
+        if (cfg.key) fd.append('key', cfg.key);
+        fd.append('max_side', cfg.max_side);
+        fd.append('color_step', cfg.color_step);
+        fd.append('image', file);
+        const res = await fetch('/image/upload', { method: 'POST', body: fd });
+        const json = await parseJson(res);
+        if (!json.ok) throw new Error(json.error || 'Upload failed');
+        state.imageUploaded = true;
+        $('imgStatus').textContent = json.summary || ('Image uploaded: ' + json.port);
+    } catch (e) {
+        $('imgStatus').textContent = 'Image error: ' + (e && e.message ? e.message : e);
+    } finally {
+        state.busyImage = false;
+    }
+};
+
+['imgRes', 'imgStep', 'sharedPort'].forEach(id => {
+    $(id).addEventListener('input', () => debounce(() => {
+        if (state.imageUploaded) reprocessImageSettings();
+    }, 'imageSettingsTimer', 500));
+});
+
+function videoSettingsPayload() {
+    return {
+        port: cleanPort($('sharedPort').value),
+        key: getKey(),
+        max_side: Math.floor(clamp($('vidRes').value, 16, {{ video_max_res }}, 64)),
+        fps: clamp($('vidFps').value, 0.25, 8, 2),
+        max_frames: Math.floor(clamp($('vidFrames').value, 1, {{ video_max_frames }}, 60)),
+        color_step: Math.floor(clamp($('vidStep').value, 4, 64, 16))
+    };
+}
+
+async function convertVideo(autoTriggered) {
+    if (state.busyVideo) return;
+    const file = $('vidFile').files[0];
+    if (!file) {
+        if (!autoTriggered) $('videoStatus').textContent = 'Choose a video first.';
+        return;
+    }
+    state.busyVideo = true;
+    $('videoConvertBtn').disabled = true;
     let objectUrl = null;
     try {
-        const port = cleanPort($("vPort").value);
-        const keyBox = $("vKey");
-        const key = keyBox ? keyBox.value : "";
-        const file = $("vFile").files[0];
-        if (!file) throw new Error("Choose a video first");
-
-        const maxSide = Math.floor(clamp($("vRes").value, 16, {{ video_max_res }}, 64));
-        const fps = clamp($("vFps").value, 0.25, 8, 2);
-        const maxFrames = Math.floor(clamp($("vFrames").value, 1, {{ video_max_frames }}, 60));
-        const colorStep = Math.floor(clamp($("vStep").value, 4, 64, 16));
+        const cfg = videoSettingsPayload();
         const chunkSize = 6;
-
-        const video = $("video");
+        const video = $('hiddenVideo');
+        const canvas = $('hiddenCanvas');
         objectUrl = URL.createObjectURL(file);
         video.src = objectUrl;
         video.load();
-        setProgress(0, 1, "Loading video metadata...");
-        await waitEvent(video, "loadedmetadata", 25000);
+        setVideoProgress(0, 1, 'Loading video...');
+        await waitEvent(video, 'loadedmetadata', 25000);
 
         const srcW = video.videoWidth || 1;
         const srcH = video.videoHeight || 1;
-        const scale = Math.min(maxSide / Math.max(srcW, 1), maxSide / Math.max(srcH, 1), 1);
+        const scale = Math.min(cfg.max_side / Math.max(srcW, 1), cfg.max_side / Math.max(srcH, 1), 1);
         const w = Math.max(1, Math.round(srcW * scale));
         const h = Math.max(1, Math.round(srcH * scale));
-        const duration = Number.isFinite(video.duration) ? video.duration : (maxFrames / fps);
-        const frameCount = Math.max(1, Math.min(maxFrames, Math.floor(duration * fps) + 1));
+        const duration = Number.isFinite(video.duration) ? video.duration : (cfg.max_frames / cfg.fps);
+        const frameCount = Math.max(1, Math.min(cfg.max_frames, Math.floor(duration * cfg.fps) + 1));
 
-        const canvas = $("canvas");
         canvas.width = w;
         canvas.height = h;
-        const ctx = canvas.getContext("2d", {willReadFrequently:true});
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         ctx.imageSmoothingEnabled = true;
 
-        await postJSON("/video_json/start", {port, key, width:w, height:h, fps, frame_count:frameCount, color_step:colorStep, chunk_size:chunkSize});
+        await postJSON('/video_json/start', {
+            port: cfg.port,
+            key: cfg.key,
+            width: w,
+            height: h,
+            fps: cfg.fps,
+            frame_count: frameCount,
+            color_step: cfg.color_step,
+            chunk_size: chunkSize
+        });
 
         let prev = null;
         let chunk = [];
         let chunkIndex = 0;
         let totalChanges = 0;
+
         for (let i = 0; i < frameCount; i++) {
-            const t = Math.min(duration, i / fps);
+            const t = Math.min(duration, i / cfg.fps);
             await seekVideo(video, t);
             ctx.clearRect(0, 0, w, h);
             ctx.drawImage(video, 0, 0, w, h);
-            const hexes = frameToHexes(ctx, w, h, colorStep);
+            const hexes = frameToHexes(ctx, w, h, cfg.color_step);
             let frame;
             if (i === 0 || !prev) {
-                frame = {index:i, pixels:hexes.join(""), change_count:w*h, full:true};
-                totalChanges += w*h;
+                frame = { index: i, pixels: hexes.join(''), change_count: w * h, full: true };
+                totalChanges += w * h;
             } else {
                 const changes = [];
                 for (let n = 0; n < hexes.length; n++) {
                     if (hexes[n] !== prev[n]) changes.push([n + 1, hexes[n]]);
                 }
-                frame = {index:i, changes, change_count:changes.length, full:false};
+                frame = { index: i, changes, change_count: changes.length, full: false };
                 totalChanges += changes.length;
             }
             chunk.push(frame);
             prev = hexes;
 
             if (chunk.length >= chunkSize || i === frameCount - 1) {
-                await postJSON("/video_json/chunk", {port, key, chunk:chunkIndex, frames:chunk});
+                await postJSON('/video_json/chunk', { port: cfg.port, key: cfg.key, chunk: chunkIndex, frames: chunk });
                 chunk = [];
                 chunkIndex++;
             }
-            setProgress(i + 1, frameCount, `Converted ${i + 1}/${frameCount} frames · ${w}x${h} · changes ${totalChanges}`);
+            setVideoProgress(i + 1, frameCount, 'Converting video... ' + (i + 1) + '/' + frameCount + ' frames');
             await new Promise(r => setTimeout(r, 1));
         }
 
-        await postJSON("/video_json/finish", {port, key});
-        setProgress(frameCount, frameCount, `Ready. Port ${port} · ${w}x${h} · ${frameCount} frames · ${fps} FPS`);
+        await postJSON('/video_json/finish', { port: cfg.port, key: cfg.key });
+        state.videoConverted = true;
+        setVideoProgress(frameCount, frameCount, 'Video ready: ' + w + 'x' + h + ' · ' + frameCount + ' frames · ' + cfg.fps + ' FPS');
+        $('pageStatus').textContent = 'Changes saved for this port.';
     } catch (e) {
-        statusEl.textContent = "Video error: " + (e && e.message ? e.message : e);
-        fillEl.style.width = "0%";
+        $('videoStatus').textContent = 'Video error: ' + (e && e.message ? e.message : e);
+        $('videoFill').style.width = '0%';
     } finally {
-        btn.disabled = false;
+        state.busyVideo = false;
+        $('videoConvertBtn').disabled = false;
         if (objectUrl) URL.revokeObjectURL(objectUrl);
     }
-};
+}
+
+$('videoConvertBtn').onclick = () => convertVideo(false);
+['vidRes', 'vidFps', 'vidFrames', 'vidStep', 'sharedPort'].forEach(id => {
+    $(id).addEventListener('input', () => debounce(() => {
+        if ($('vidFile').files[0]) convertVideo(true);
+    }, 'videoSettingsTimer', 700));
+});
+$('vidFile').addEventListener('change', () => debounce(() => convertVideo(true), 'videoSettingsTimer', 250));
+
+async function loadCurrentMeta() {
+    try {
+        const port = cleanPort($('sharedPort').value || '{{ port }}');
+        const imageMeta = await fetch('/image/meta?port=' + encodeURIComponent(port)).then(parseJson);
+        if (imageMeta.ok && imageMeta.settings) {
+            $('imgRes').value = imageMeta.settings.max_side || 96;
+            $('imgStep').value = imageMeta.settings.color_step || 16;
+            if (imageMeta.image_ready) {
+                state.imageUploaded = true;
+                $('imgStatus').textContent = imageMeta.summary || 'Image ready on this port.';
+            }
+        }
+        const videoMeta = await fetch('/video/meta?port=' + encodeURIComponent(port)).then(parseJson);
+        if (videoMeta.ok) {
+            $('vidRes').value = videoMeta.width || 64;
+            $('vidFps').value = videoMeta.fps || 2;
+            $('vidFrames').value = videoMeta.frame_count || 60;
+            $('vidStep').value = videoMeta.color_step || 16;
+            state.videoConverted = !!videoMeta.ready;
+            $('videoStatus').textContent = 'Video ready: ' + (videoMeta.width || 0) + 'x' + (videoMeta.height || 0) + ' · ' + (videoMeta.frame_count || 0) + ' frames · ' + (videoMeta.fps || 0) + ' FPS';
+            $('videoFill').style.width = videoMeta.ready ? '100%' : '0%';
+        }
+    } catch (e) {
+    }
+}
+
+loadCurrentMeta();
 </script>
 </body>
 </html>
-"""
+'''
 
 
 def json_error(message: str, status: int = 200, extra: Optional[Dict[str, Any]] = None):
@@ -278,6 +472,7 @@ def handle_any_exception(e):
     return json_error("Server error: " + str(e), 200)
 
 
+# ---------- utils ----------
 def clean_port(value: str) -> str:
     value = "".join(ch for ch in str(value or "") if ch.isdigit())
     if len(value) < 3:
@@ -291,6 +486,10 @@ def port_file(port: str) -> str:
 
 def original_file(port: str) -> str:
     return os.path.join(ORIGINAL_DIR, f"{clean_port(port)}.bin")
+
+
+def image_settings_file(port: str) -> str:
+    return os.path.join(IMAGE_SETTINGS_DIR, f"{clean_port(port)}.json")
 
 
 def video_port_dir(port: str) -> str:
@@ -319,9 +518,9 @@ def atomic_write_json(path: str, data: Dict[str, Any]) -> None:
 
 def read_json_body() -> Dict[str, Any]:
     try:
-        data = request.get_json(silent=True)
-        if isinstance(data, dict):
-            return data
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            return body
     except Exception:
         pass
     return {}
@@ -331,23 +530,12 @@ def check_key(req) -> bool:
     if not IMAGE_KEY:
         return True
     body = read_json_body()
-    return (
-        (req.values.get("key", "") or req.headers.get("X-Image-Key", "") or body.get("key", ""))
-        == IMAGE_KEY
-    )
+    return (req.values.get("key", "") or req.headers.get("X-Image-Key", "") or body.get("key", "")) == IMAGE_KEY
 
 
-def read_int(name: str, default: int, lo: int, hi: int) -> int:
+def read_int_arg(args, name: str, default: int, lo: int, hi: int) -> int:
     try:
-        value = int(request.values.get(name, default))
-    except Exception:
-        value = default
-    return max(lo, min(hi, value))
-
-
-def read_float(name: str, default: float, lo: float, hi: float) -> float:
-    try:
-        value = float(request.values.get(name, default))
+        value = int(args.get(name, default))
     except Exception:
         value = default
     return max(lo, min(hi, value))
@@ -360,6 +548,42 @@ def quantize_channel(v: int, step: int) -> int:
 
 def quantize_color(r: int, g: int, b: int, step: int) -> Tuple[int, int, int]:
     return (quantize_channel(r, step), quantize_channel(g, step), quantize_channel(b, step))
+
+
+# ---------- image processing ----------
+def default_image_settings() -> Dict[str, Any]:
+    return {
+        "max_side": DEFAULT_RES,
+        "color_step": DEFAULT_COLOR_STEP,
+        "updated_at": int(time.time()),
+    }
+
+
+def load_image_settings(port: str) -> Dict[str, Any]:
+    path = image_settings_file(port)
+    if not os.path.exists(path):
+        return default_image_settings()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out = default_image_settings()
+        out["max_side"] = max(8, min(ABS_MAX_RES, int(data.get("max_side", DEFAULT_RES))))
+        out["color_step"] = max(4, min(64, int(data.get("color_step", DEFAULT_COLOR_STEP))))
+        out["updated_at"] = int(data.get("updated_at", int(time.time())))
+        return out
+    except Exception:
+        return default_image_settings()
+
+
+def save_image_settings(port: str, max_side: int, color_step: int) -> Dict[str, Any]:
+    settings = {
+        "max_side": max(8, min(ABS_MAX_RES, int(max_side))),
+        "color_step": max(4, min(64, int(color_step))),
+        "updated_at": int(time.time()),
+        "port": clean_port(port),
+    }
+    atomic_write_json(image_settings_file(port), settings)
+    return settings
 
 
 def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) -> Dict[str, Any]:
@@ -407,8 +631,11 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
                 if used[j]:
                     continue
                 if (
-                    other["x"] == current["x"] and other["w"] == current["w"]
-                    and other["r"] == current["r"] and other["g"] == current["g"] and other["b"] == current["b"]
+                    other["x"] == current["x"]
+                    and other["w"] == current["w"]
+                    and other["r"] == current["r"]
+                    and other["g"] == current["g"]
+                    and other["b"] == current["b"]
                     and other["y"] == current["y"] + current["h"]
                 ):
                     current["h"] += other["h"]
@@ -483,10 +710,19 @@ def load_original_as_rects(port: str, max_w: int, max_h: int, color_step: int) -
     return data
 
 
+def reprocess_image_for_port(port: str, max_side: int, color_step: int) -> Dict[str, Any]:
+    data = load_original_as_rects(port, max_side, max_side, color_step)
+    if data is None:
+        return {"ok": False, "error": "No image uploaded on this port", "port": clean_port(port)}
+    save_latest(port, data)
+    return data
+
+
+# ---------- video storage ----------
 def load_video_meta(port: str) -> Dict[str, Any]:
     path = video_meta_file(port)
     if not os.path.exists(path):
-        return {"ok": False, "error": "No browser-converted video on this port", "port": clean_port(port), "type": "video"}
+        return {"ok": False, "error": "No video on this port", "port": clean_port(port), "type": "video"}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -539,50 +775,106 @@ def find_frame(port: str, index: int, meta: Dict[str, Any]) -> Optional[Dict[str
     return None
 
 
+# ---------- routes ----------
 @app.route("/", methods=["GET"])
 def index():
     port = request.args.get("port", "").strip()
-    status = "<span class='bad'>No port</span>"
+    status_port = ""
     if port:
         try:
-            p = clean_port(port)
-            img = load_cached_latest(p)
-            vid = load_video_meta(p)
-            parts = []
-            if img.get("ok"):
-                parts.append(f"<span class='ok'>Image ready: {p}</span><br>{img.get('width')}x{img.get('height')} · Rects: {img.get('rect_count')}")
-            if vid.get("ok"):
-                parts.append(f"<span class='ok'>Video ready: {p}</span><br>{vid.get('width')}x{vid.get('height')} · Frames: {vid.get('frame_count')} · FPS: {vid.get('fps')}")
-            status = "<br><br>".join(parts) if parts else "<span class='bad'>Nothing uploaded for this port</span>"
-        except Exception as e:
-            status = f"<span class='bad'>{e}</span>"
-    return render_template_string(HTML, status=status, port=port, show_key=bool(IMAGE_KEY), video_max_res=VIDEO_MAX_RES, video_max_frames=VIDEO_MAX_FRAMES)
+            status_port = clean_port(port)
+        except Exception:
+            status_port = ""
+    return render_template_string(
+        HTML,
+        port=status_port,
+        show_key=bool(IMAGE_KEY),
+        abs_max_res=ABS_MAX_RES,
+        video_max_res=VIDEO_MAX_RES,
+        video_max_frames=VIDEO_MAX_FRAMES,
+    )
 
 
-@app.route("/upload", methods=["POST"])
-def upload():
+@app.route("/image/meta", methods=["GET"])
+def image_meta():
+    if IMAGE_KEY and not check_key(request):
+        return json_error("Bad key", 403)
+    port = clean_port(request.args.get("port", ""))
+    settings = load_image_settings(port)
+    latest = load_cached_latest(port)
+    image_ready = bool(latest.get("ok"))
+    summary = None
+    if image_ready:
+        summary = f"Image ready: {latest.get('width')}x{latest.get('height')} · rects {latest.get('rect_count')}"
+    else:
+        summary = "No image uploaded on this port yet."
+    resp = jsonify({
+        "ok": True,
+        "type": "image_meta",
+        "port": port,
+        "settings": settings,
+        "image_ready": image_ready,
+        "summary": summary,
+    })
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.route("/image/upload", methods=["POST"])
+def image_upload():
     if not check_key(request):
         return json_error("Bad key", 403)
     if "image" not in request.files:
         return json_error("No image", 400)
     port = clean_port(request.form.get("port", ""))
+    max_side = read_int_arg(request.form, "max_side", DEFAULT_RES, 8, ABS_MAX_RES)
+    color_step = read_int_arg(request.form, "color_step", DEFAULT_COLOR_STEP, 4, 64)
     raw = request.files["image"].read()
     if not raw:
         return json_error("Empty image", 400)
     save_original(port, raw)
+    settings = save_image_settings(port, max_side, color_step)
     try:
-        img = Image.open(BytesIO(raw))
-        img.load()
-        save_latest(port, image_to_rects_safe(img, DEFAULT_RES, DEFAULT_RES, DEFAULT_COLOR_STEP))
+        data = reprocess_image_for_port(port, settings["max_side"], settings["color_step"])
+        if not data.get("ok"):
+            return jsonify(data)
+        return jsonify({
+            "ok": True,
+            "type": "image_upload",
+            "port": port,
+            "image": data,
+            "settings": settings,
+            "summary": f"Image ready: {data.get('width')}x{data.get('height')} · rects {data.get('rect_count')}",
+        })
     except Exception as e:
         return json_error("Saved, conversion failed: " + str(e), 200, {"port": port})
-    return f"""
-    <body style="background:#111;color:white;font-family:Arial;padding:24px">
-        <h2>Uploaded</h2>
-        <p>Port: {port}</p>
-        <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
-    </body>
-    """
+
+
+@app.route("/upload", methods=["POST"])
+def upload_legacy():
+    return image_upload()
+
+
+@app.route("/image/settings", methods=["POST"])
+def image_settings_update():
+    if not check_key(request):
+        return json_error("Bad key", 403)
+    body = read_json_body()
+    port = clean_port(body.get("port", ""))
+    max_side = max(8, min(ABS_MAX_RES, int(body.get("max_side", DEFAULT_RES))))
+    color_step = max(4, min(64, int(body.get("color_step", DEFAULT_COLOR_STEP))))
+    settings = save_image_settings(port, max_side, color_step)
+    result = reprocess_image_for_port(port, settings["max_side"], settings["color_step"])
+    image_ready = bool(result.get("ok"))
+    summary = result.get("error") if not image_ready else f"Image updated: {result.get('width')}x{result.get('height')} · rects {result.get('rect_count')}"
+    return jsonify({
+        "ok": True,
+        "type": "image_settings",
+        "port": port,
+        "settings": settings,
+        "image_ready": image_ready,
+        "summary": summary,
+    })
 
 
 @app.route("/latest", methods=["GET"])
@@ -590,9 +882,15 @@ def latest():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
     port = clean_port(request.args.get("port", ""))
-    max_w = read_int("max_w", DEFAULT_RES, 8, ABS_MAX_RES)
-    max_h = read_int("max_h", DEFAULT_RES, 8, ABS_MAX_RES)
-    color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
+    settings = load_image_settings(port)
+    if "max_w" in request.args or "max_h" in request.args or "color_step" in request.args:
+        max_w = read_int_arg(request.args, "max_w", settings["max_side"], 8, ABS_MAX_RES)
+        max_h = read_int_arg(request.args, "max_h", settings["max_side"], 8, ABS_MAX_RES)
+        color_step = read_int_arg(request.args, "color_step", settings["color_step"], 4, 64)
+    else:
+        max_w = settings["max_side"]
+        max_h = settings["max_side"]
+        color_step = settings["color_step"]
     try:
         data = load_original_as_rects(port, max_w, max_h, color_step)
     except Exception as e:
@@ -601,6 +899,8 @@ def latest():
         data["server_error"] = str(e)
     if data is None:
         data = load_cached_latest(port)
+    if data.get("ok"):
+        data["settings"] = settings
     resp = jsonify(data)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
@@ -639,7 +939,6 @@ def video_json_start():
         "chunk_size": chunk_size,
         "chunk_count": int((frame_count + chunk_size - 1) // chunk_size),
         "ready": False,
-        "browser_converted": True,
         "created_at": int(time.time()),
         "version": str(int(time.time() * 1000)),
     }
@@ -739,7 +1038,7 @@ def video_frame():
         return jsonify(meta)
     if not meta.get("ready", False):
         return json_error("Video is not finished yet", 200, {"port": port, "type": "video_frame"})
-    index = read_int("index", 0, 0, max(0, int(meta.get("frame_count", 1)) - 1))
+    index = read_int_arg(request.args, "index", 0, 0, max(0, int(meta.get("frame_count", 1)) - 1))
     frame = find_frame(port, index, meta)
     if not frame:
         return json_error("Frame not found", 200, {"port": port, "index": index, "type": "video_frame"})
@@ -759,8 +1058,8 @@ def video_frames():
     if not meta.get("ready", False):
         return json_error("Video is not finished yet", 200, {"port": port, "type": "video_frames"})
     frame_count = max(1, int(meta.get("frame_count", 1)))
-    start = read_int("start", 0, 0, frame_count - 1)
-    count = read_int("count", 4, 1, VIDEO_MAX_CHUNK_FRAMES)
+    start = read_int_arg(request.args, "start", 0, 0, frame_count - 1)
+    count = read_int_arg(request.args, "count", 4, 1, VIDEO_MAX_CHUNK_FRAMES)
     frames = []
     for offset in range(count):
         idx = start + offset
@@ -791,7 +1090,7 @@ def clear():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
     port = clean_port(request.values.get("port", ""))
-    for path in (port_file(port), original_file(port)):
+    for path in (port_file(port), original_file(port), image_settings_file(port)):
         if os.path.exists(path):
             os.remove(path)
     pdir = video_port_dir(port)
@@ -810,23 +1109,10 @@ def ping():
     return jsonify({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-browser-convert",
+        "service": "image-video-painter",
         "abs_max_res": ABS_MAX_RES,
         "video_max_res": VIDEO_MAX_RES,
         "video_max_frames": VIDEO_MAX_FRAMES,
-        "mode": "browser converts video; server stores JSON chunks",
-    })
-
-
-@app.route("/debug", methods=["GET"])
-def debug():
-    return jsonify({
-        "ok": True,
-        "time": int(time.time()),
-        "data_dir": DATA_DIR,
-        "video_dir": VIDEO_DIR,
-        "image_key_enabled": bool(IMAGE_KEY),
-        "ports": sorted(os.listdir(VIDEO_DIR))[:50] if os.path.isdir(VIDEO_DIR) else [],
     })
 
 
