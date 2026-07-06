@@ -1,6 +1,6 @@
 Flask
+gunicorn
 Pillow
 numpy
 imageio
 imageio-ffmpeg
-gunicorn
