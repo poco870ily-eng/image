@@ -5,7 +5,7 @@ import math
 import time
 import traceback
 from io import BytesIO
-from typing import Dict, Any, List, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify, render_template_string
 from PIL import Image, ImageFile
@@ -18,8 +18,8 @@ app = Flask(__name__)
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
-VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
 VIDEO_ORIGINAL_DIR = os.environ.get("VIDEO_ORIGINAL_DIR", "video_originals")
+VIDEO_CACHE_DIR = os.environ.get("VIDEO_CACHE_DIR", "video_cache")
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_COLOR_STEP = int(os.environ.get("DEFAULT_COLOR_STEP", "16"))
@@ -30,11 +30,11 @@ ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", str(min(DEFAULT_RES, 96))))
 DEFAULT_VIDEO_FPS = float(os.environ.get("DEFAULT_VIDEO_FPS", "2"))
 MAX_VIDEO_FPS = float(os.environ.get("MAX_VIDEO_FPS", "8"))
-MAX_VIDEO_FRAMES = int(os.environ.get("MAX_VIDEO_FRAMES", "120"))
+MAX_VIDEO_FRAMES = int(os.environ.get("MAX_VIDEO_FRAMES", "160"))
 VIDEO_MAX_PIXELS = int(os.environ.get("VIDEO_MAX_PIXELS", "9216"))
 
-for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, VIDEO_ORIGINAL_DIR):
-    os.makedirs(path, exist_ok=True)
+for folder in (DATA_DIR, ORIGINAL_DIR, VIDEO_ORIGINAL_DIR, VIDEO_CACHE_DIR):
+    os.makedirs(folder, exist_ok=True)
 
 HTML = """
 <!doctype html>
@@ -79,7 +79,7 @@ HTML = """
     <p class="hint">
         Image: <code>/latest?port=PORT</code><br>
         Video: <code>/video/meta?port=PORT</code> · <code>/video/frame?port=PORT&amp;index=0</code><br>
-        Keep video quality low for Roblox playback. 2 FPS and 64-96px usually works best.
+        Upload is instant now. Frames are decoded lazily when the Roblox script asks for them.
     </p>
 </div>
 </body>
@@ -87,20 +87,24 @@ HTML = """
 """
 
 
-def json_error(message: str, status: int = 200, extra: Optional[Dict[str, Any]] = None):
-    data = {"ok": False, "error": str(message)}
-    if extra:
-        data.update(extra)
+def json_response(data: Dict[str, Any], status: int = 200):
     resp = jsonify(data)
     resp.status_code = status
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
 
+def json_error(message: str, status: int = 200, extra: Optional[Dict[str, Any]] = None):
+    data = {"ok": False, "error": str(message)}
+    if extra:
+        data.update(extra)
+    return json_response(data, status)
+
+
 @app.errorhandler(Exception)
 def handle_any_exception(e):
     traceback.print_exc()
-    return json_error("Server error: " + str(e), 200)
+    return json_error("Server error: " + str(e), 200, {"trace": traceback.format_exc()[-1800:]})
 
 
 def clean_port(value: str) -> str:
@@ -110,40 +114,45 @@ def clean_port(value: str) -> str:
     return value[:8]
 
 
-def clean_number_token(value: Any, default: str) -> str:
+def clean_token(value: Any, default: str = "0") -> str:
     raw = str(value if value is not None else default)
     out = []
     for ch in raw:
-        if ch.isdigit() or ch in ".-":
+        if ch.isalnum() or ch in "._-":
             out.append(ch)
-    return "".join(out) or str(default)
+    return ("".join(out) or default)[:80]
 
 
-def port_file(port: str) -> str:
+def image_json_file(port: str) -> str:
     return os.path.join(DATA_DIR, f"{clean_port(port)}.json")
 
 
-def original_file(port: str) -> str:
+def image_original_file(port: str) -> str:
     return os.path.join(ORIGINAL_DIR, f"{clean_port(port)}.bin")
 
 
 def video_original_file(port: str, filename: str = "") -> str:
     ext = os.path.splitext(filename or "video.bin")[1].lower()
-    if not ext or len(ext) > 8:
+    if not ext or len(ext) > 10:
         ext = ".bin"
     return os.path.join(VIDEO_ORIGINAL_DIR, f"{clean_port(port)}{ext}")
 
 
 def find_video_original(port: str) -> Optional[str]:
     matches = glob.glob(os.path.join(VIDEO_ORIGINAL_DIR, f"{clean_port(port)}.*"))
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return matches[0] if matches else None
 
 
-def video_cache_file(port: str, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> str:
-    fps_token = clean_number_token(round(float(fps), 3), "2").replace(".", "p")
+def video_info_file(port: str) -> str:
+    return os.path.join(VIDEO_CACHE_DIR, f"{clean_port(port)}_info.json")
+
+
+def video_frame_cache_file(port: str, index: int, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> str:
+    fps_token = clean_token(str(round(float(fps), 3)).replace(".", "p"), "2")
     return os.path.join(
-        VIDEO_DIR,
-        f"{clean_port(port)}_{int(max_w)}x{int(max_h)}_c{int(color_step)}_f{fps_token}_m{int(max_frames)}.json",
+        VIDEO_CACHE_DIR,
+        f"{clean_port(port)}_{int(max_w)}x{int(max_h)}_c{int(color_step)}_f{fps_token}_m{int(max_frames)}_i{int(index)}.json",
     )
 
 
@@ -156,6 +165,13 @@ def atomic_write(path: str, data: bytes) -> None:
 
 def atomic_write_json(path: str, data: Dict[str, Any]) -> None:
     atomic_write(path, json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def load_json_file(path: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def check_key(req) -> bool:
@@ -186,11 +202,7 @@ def quantize_channel(v: int, step: int) -> int:
 
 
 def quantize_color(r: int, g: int, b: int, step: int) -> Tuple[int, int, int]:
-    return (
-        quantize_channel(r, step),
-        quantize_channel(g, step),
-        quantize_channel(b, step),
-    )
+    return (quantize_channel(r, step), quantize_channel(g, step), quantize_channel(b, step))
 
 
 def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) -> Dict[str, Any]:
@@ -199,7 +211,6 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
     scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
-
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
     pixels = img.load()
 
@@ -219,20 +230,10 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
             if color is None:
                 x += 1
                 continue
-
             x2 = x + 1
             while x2 < new_w and grid[y][x2] == color:
                 x2 += 1
-
-            runs.append({
-                "x": x,
-                "y": y,
-                "w": x2 - x,
-                "h": 1,
-                "r": color[0],
-                "g": color[1],
-                "b": color[2],
-            })
+            runs.append({"x": x, "y": y, "w": x2 - x, "h": 1, "r": color[0], "g": color[1], "b": color[2]})
             x = x2
 
     merged = []
@@ -240,17 +241,14 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
     for i, run in enumerate(runs):
         if used[i]:
             continue
-
         current = dict(run)
         used[i] = True
-
         changed = True
         while changed:
             changed = False
             for j, other in enumerate(runs):
                 if used[j]:
                     continue
-
                 if (
                     other["x"] == current["x"]
                     and other["w"] == current["w"]
@@ -262,7 +260,6 @@ def image_to_rects(img: Image.Image, max_w: int, max_h: int, color_step: int) ->
                     current["h"] += other["h"]
                     used[j] = True
                     changed = True
-
         merged.append(current)
 
     return {
@@ -284,58 +281,44 @@ def image_to_rects_safe(img: Image.Image, max_w: int, max_h: int, color_step: in
     max_w = max(1, min(ABS_MAX_RES, int(max_w)))
     max_h = max(1, min(ABS_MAX_RES, int(max_h)))
     color_step = max(4, min(64, int(color_step)))
-
     last = None
-
     for _ in range(8):
         data = image_to_rects(img, max_w, max_h, color_step)
         last = data
-
         if data["rect_count"] <= MAX_RECTS:
             return data
-
         if max_w > 64 or max_h > 64:
             max_w = max(64, int(max_w * 0.82))
             max_h = max(64, int(max_h * 0.82))
         else:
             color_step = min(64, color_step * 2)
-
     if last is None:
         raise RuntimeError("Conversion failed")
-
     last["warning"] = "Auto reduced"
     return last
 
 
-def save_latest(port: str, data: Dict[str, Any]) -> None:
+def save_latest_image(port: str, data: Dict[str, Any]) -> None:
     data["port"] = clean_port(port)
-    atomic_write_json(port_file(port), data)
+    atomic_write_json(image_json_file(port), data)
 
 
-def save_original(port: str, raw: bytes) -> None:
-    atomic_write(original_file(port), raw)
-
-
-def load_cached_latest(port: str) -> Dict[str, Any]:
-    path = port_file(port)
+def load_cached_latest_image(port: str) -> Dict[str, Any]:
+    path = image_json_file(port)
     if not os.path.exists(path):
-        return {"ok": False, "error": "No image", "port": port}
-
+        return {"ok": False, "error": "No image", "port": clean_port(port)}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_original_as_rects(port: str, max_w: int, max_h: int, color_step: int) -> Optional[Dict[str, Any]]:
-    path = original_file(port)
+def load_original_image_as_rects(port: str, max_w: int, max_h: int, color_step: int) -> Optional[Dict[str, Any]]:
+    path = image_original_file(port)
     if not os.path.exists(path):
         return None
-
     with open(path, "rb") as f:
         raw = f.read()
-
     img = Image.open(BytesIO(raw))
     img.load()
-
     data = image_to_rects_safe(img, max_w, max_h, color_step)
     data["port"] = clean_port(port)
     data["dynamic"] = True
@@ -353,15 +336,21 @@ def clamp_video_size(max_w: int, max_h: int) -> Tuple[int, int]:
     return max_w, max_h
 
 
-def frame_to_hex_pixels(img: Image.Image, max_w: int, max_h: int, color_step: int) -> Tuple[int, int, str]:
+def resize_frame_to_target(img: Image.Image, max_w: int, max_h: int, target_size: Optional[Tuple[int, int]] = None) -> Image.Image:
     img = img.convert("RGBA")
+    if target_size and target_size[0] > 0 and target_size[1] > 0:
+        return img.resize((int(target_size[0]), int(target_size[1])), Image.Resampling.BILINEAR)
     w, h = img.size
     scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
-    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-    pixels = img.load()
+    return img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
+
+def frame_to_hex_pixels(img: Image.Image, max_w: int, max_h: int, color_step: int, target_size: Optional[Tuple[int, int]] = None) -> Tuple[int, int, str]:
+    img = resize_frame_to_target(img, max_w, max_h, target_size)
+    new_w, new_h = img.size
+    pixels = img.load()
     chunks: List[str] = []
     for y in range(new_h):
         for x in range(new_w):
@@ -376,255 +365,348 @@ def frame_to_hex_pixels(img: Image.Image, max_w: int, max_h: int, color_step: in
 
 def is_probably_video(filename: str, mimetype: str) -> bool:
     ext = os.path.splitext(filename or "")[1].lower()
-    return (mimetype or "").startswith("video/") or ext in {
-        ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv"
-    }
+    return (mimetype or "").startswith("video/") or ext in {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv"}
 
 
-def pil_is_animated_image(raw: bytes) -> bool:
+def pil_open(raw_or_path: Any) -> Image.Image:
+    if isinstance(raw_or_path, (bytes, bytearray)):
+        return Image.open(BytesIO(raw_or_path))
+    return Image.open(raw_or_path)
+
+
+def pil_is_animated(path: str) -> bool:
     try:
-        img = Image.open(BytesIO(raw))
+        img = Image.open(path)
         return bool(getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1)
     except Exception:
         return False
 
 
-def extract_frames_from_animated_pil(raw: bytes, fps: float, max_frames: int) -> List[Image.Image]:
-    img = Image.open(BytesIO(raw))
-    frames: List[Image.Image] = []
-    interval = 1.0 / max(fps, 0.1)
-    current_t = 0.0
-    next_t = 0.0
+def get_pil_animated_info(path: str, fps: float, max_frames: int, max_w: int, max_h: int) -> Dict[str, Any]:
+    img = Image.open(path)
     n_frames = int(getattr(img, "n_frames", 1))
+    total_duration = 0.0
+    for i in range(min(n_frames, 5000)):
+        try:
+            img.seek(i)
+            total_duration += max(float(img.info.get("duration", 100) or 100) / 1000.0, 0.01)
+        except Exception:
+            break
+    if total_duration <= 0:
+        total_duration = n_frames / max(fps, 0.1)
+    first = get_pil_animated_frame(path, 0, fps)
+    first_resized = resize_frame_to_target(first, max_w, max_h)
+    width, height = first_resized.size
+    frame_count = max(1, min(max_frames, int(math.ceil(total_duration * fps))))
+    return {"width": width, "height": height, "frame_count": frame_count, "source_fps": None, "duration": total_duration}
 
+
+def get_pil_animated_frame(path: str, sampled_index: int, fps: float) -> Image.Image:
+    img = Image.open(path)
+    n_frames = int(getattr(img, "n_frames", 1))
+    target_t = max(0.0, float(sampled_index) / max(fps, 0.1))
+    current_t = 0.0
+    last = None
     for i in range(n_frames):
         img.seek(i)
-        duration = float(img.info.get("duration", 100) or 100) / 1000.0
-        if current_t + 1e-6 >= next_t or i == 0:
-            frames.append(img.convert("RGBA").copy())
-            next_t += interval
-            if len(frames) >= max_frames:
-                break
-        current_t += max(duration, 0.01)
-
-    if not frames:
+        last = img.convert("RGBA").copy()
+        duration = max(float(img.info.get("duration", 100) or 100) / 1000.0, 0.01)
+        if current_t + duration >= target_t:
+            return last
+        current_t += duration
+    if last is None:
         img.seek(0)
-        frames.append(img.convert("RGBA").copy())
-    return frames
+        return img.convert("RGBA").copy()
+    return last
 
 
-def extract_frames_with_imageio(path: str, fps: float, max_frames: int) -> List[Image.Image]:
+def imageio_reader(path: str):
     import imageio.v2 as imageio  # type: ignore
-
     try:
-        reader = imageio.get_reader(path, format="FFMPEG")
-    except TypeError:
-        reader = imageio.get_reader(path)
+        return imageio.get_reader(path, format="FFMPEG")
     except Exception:
-        reader = imageio.get_reader(path)
+        return imageio.get_reader(path)
 
+
+def get_imageio_info(path: str, fps: float, max_frames: int, max_w: int, max_h: int) -> Dict[str, Any]:
+    reader = imageio_reader(path)
     try:
-        meta = reader.get_meta_data() or {}
-        source_fps = float(meta.get("fps") or 0)
-    except Exception:
-        source_fps = 0.0
-
-    step = max(1, int(round((source_fps or 30.0) / max(fps, 0.1))))
-    frames: List[Image.Image] = []
-
-    try:
-        for i, frame in enumerate(reader):
-            if i % step != 0:
-                continue
-            frames.append(Image.fromarray(frame).convert("RGBA"))
-            if len(frames) >= max_frames:
-                break
+        try:
+            meta = reader.get_meta_data() or {}
+        except Exception:
+            meta = {}
+        source_fps = float(meta.get("fps") or 0) or None
+        duration = float(meta.get("duration") or 0) or None
+        nframes_raw = meta.get("nframes") or meta.get("n_frames") or None
+        nframes = None
+        try:
+            if nframes_raw and math.isfinite(float(nframes_raw)):
+                nframes = int(nframes_raw)
+        except Exception:
+            nframes = None
+        frame0 = reader.get_data(0)
+        img0 = Image.fromarray(frame0).convert("RGBA")
+        width, height = resize_frame_to_target(img0, max_w, max_h).size
+        if duration and duration > 0:
+            frame_count = int(math.ceil(duration * fps))
+        elif nframes and source_fps:
+            frame_count = int(math.ceil(nframes / max(source_fps / fps, 1)))
+        else:
+            frame_count = max_frames
+        frame_count = max(1, min(max_frames, frame_count))
+        return {"width": width, "height": height, "frame_count": frame_count, "source_fps": source_fps or 30.0, "duration": duration}
     finally:
         try:
             reader.close()
         except Exception:
             pass
 
-    return frames
+
+def get_imageio_frame(path: str, sampled_index: int, fps: float) -> Image.Image:
+    reader = imageio_reader(path)
+    try:
+        try:
+            meta = reader.get_meta_data() or {}
+            source_fps = float(meta.get("fps") or 30.0)
+        except Exception:
+            source_fps = 30.0
+        source_index = max(0, int(round(float(sampled_index) * source_fps / max(fps, 0.1))))
+        try:
+            frame = reader.get_data(source_index)
+            return Image.fromarray(frame).convert("RGBA")
+        except Exception:
+            last = None
+            for i, frame in enumerate(reader):
+                if i > source_index:
+                    break
+                last = frame
+            if last is None:
+                raise
+            return Image.fromarray(last).convert("RGBA")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
 
-def extract_frames_with_cv2(path: str, fps: float, max_frames: int) -> List[Image.Image]:
+def get_cv2_info(path: str, fps: float, max_frames: int, max_w: int, max_h: int) -> Dict[str, Any]:
     import cv2  # type: ignore
-
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return []
-
-    source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    step = max(1, int(round(source_fps / max(fps, 0.1))))
-    frames: List[Image.Image] = []
-    idx = 0
-
+        raise RuntimeError("cv2 could not open video")
     try:
-        while len(frames) < max_frames:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if idx % step == 0:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame).convert("RGBA"))
-            idx += 1
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        ok, frame = cap.read()
+        if not ok:
+            raise RuntimeError("cv2 could not read first frame")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img0 = Image.fromarray(frame).convert("RGBA")
+        width, height = resize_frame_to_target(img0, max_w, max_h).size
+        if total > 0 and source_fps > 0:
+            frame_count = int(math.ceil((total / source_fps) * fps))
+        else:
+            frame_count = max_frames
+        frame_count = max(1, min(max_frames, frame_count))
+        return {"width": width, "height": height, "frame_count": frame_count, "source_fps": source_fps, "duration": (total / source_fps) if total and source_fps else None}
     finally:
         cap.release()
 
-    return frames
+
+def get_cv2_frame(path: str, sampled_index: int, fps: float) -> Image.Image:
+    import cv2  # type: ignore
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError("cv2 could not open video")
+    try:
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        source_index = max(0, int(round(float(sampled_index) * source_fps / max(fps, 0.1))))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, source_index)
+        ok, frame = cap.read()
+        if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, source_index - 1))
+            ok, frame = cap.read()
+        if not ok:
+            raise RuntimeError("cv2 could not read requested frame")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame).convert("RGBA")
+    finally:
+        cap.release()
 
 
-def extract_video_frames(path: str, raw: bytes, filename: str, mimetype: str, fps: float, max_frames: int) -> List[Image.Image]:
-    if pil_is_animated_image(raw):
-        return extract_frames_from_animated_pil(raw, fps, max_frames)
+def get_video_info(port: str, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> Dict[str, Any]:
+    original = find_video_original(port)
+    if not original:
+        return {"ok": False, "error": "No video", "port": clean_port(port), "type": "video"}
+
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
+
+    base = {
+        "ok": True,
+        "type": "video",
+        "port": clean_port(port),
+        "created_at": int(os.path.getmtime(original)),
+        "fps": fps,
+        "max_frames": max_frames,
+        "color_step": color_step,
+        "source_file": os.path.basename(original),
+        "lazy": True,
+    }
 
     errors: List[str] = []
     try:
-        frames = extract_frames_with_imageio(path, fps, max_frames)
-        if frames:
-            return frames
+        if pil_is_animated(original):
+            info = get_pil_animated_info(original, fps, max_frames, max_w, max_h)
+            base.update(info)
+            base["decoder"] = "pillow"
+            base["pixel_count"] = int(base["width"] * base["height"])
+            return base
+    except Exception as e:
+        errors.append("pillow: " + str(e))
+
+    try:
+        info = get_imageio_info(original, fps, max_frames, max_w, max_h)
+        base.update(info)
+        base["decoder"] = "imageio"
+        base["pixel_count"] = int(base["width"] * base["height"])
+        return base
     except Exception as e:
         errors.append("imageio: " + str(e))
 
     try:
-        frames = extract_frames_with_cv2(path, fps, max_frames)
-        if frames:
-            return frames
+        info = get_cv2_info(original, fps, max_frames, max_w, max_h)
+        base.update(info)
+        base["decoder"] = "cv2"
+        base["pixel_count"] = int(base["width"] * base["height"])
+        return base
     except Exception as e:
         errors.append("cv2: " + str(e))
 
-    raise RuntimeError(
-        "Could not read video. Use GIF/WebP/APNG or install imageio-ffmpeg / opencv-python-headless. "
-        + " | ".join(errors[:2])
-    )
-
-
-def build_video_data_from_frames(
-    port: str,
-    frames: List[Image.Image],
-    max_w: int,
-    max_h: int,
-    color_step: int,
-    fps: float,
-    max_frames: int,
-) -> Dict[str, Any]:
-    if not frames:
-        raise RuntimeError("No video frames")
-
-    max_w, max_h = clamp_video_size(max_w, max_h)
-    color_step = max(4, min(64, int(color_step)))
-    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
-    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
-
-    converted = []
-    final_w = final_h = None
-
-    for img in frames[:max_frames]:
-        w, h, pixels = frame_to_hex_pixels(img, max_w, max_h, color_step)
-        if final_w is None:
-            final_w, final_h = w, h
-        elif w != final_w or h != final_h:
-            fixed = img.convert("RGBA").resize((final_w, final_h), Image.Resampling.BILINEAR)
-            w, h, pixels = frame_to_hex_pixels(fixed, final_w, final_h, color_step)
-        converted.append({"pixels": pixels})
-
     return {
-        "ok": True,
+        "ok": False,
         "type": "video",
-        "created_at": int(time.time()),
         "port": clean_port(port),
-        "width": int(final_w or 1),
-        "height": int(final_h or 1),
-        "fps": fps,
-        "frame_count": len(converted),
-        "max_frames": max_frames,
-        "color_step": color_step,
-        "pixel_count": int((final_w or 1) * (final_h or 1)),
-        "frames": converted,
+        "error": "Could not read video. Install imageio + imageio-ffmpeg or upload GIF/WebP/APNG. " + " | ".join(errors[:3]),
     }
 
 
-def load_or_make_video_data(port: str, max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> Dict[str, Any]:
-    max_w, max_h = clamp_video_size(max_w, max_h)
-    color_step = max(4, min(64, int(color_step)))
-    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
-    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
-
-    cache_path = video_cache_file(port, max_w, max_h, color_step, fps, max_frames)
-    if os.path.exists(cache_path):
-        with open(cache_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
+def decode_video_frame(port: str, index: int, info: Dict[str, Any], max_w: int, max_h: int, color_step: int, fps: float, max_frames: int) -> Dict[str, Any]:
+    if info.get("ok") is not True:
+        return info
     original = find_video_original(port)
     if not original:
-        return {"ok": False, "error": "No video", "port": clean_port(port)}
+        return {"ok": False, "error": "No video", "port": clean_port(port), "type": "video_frame"}
 
-    with open(original, "rb") as f:
-        raw = f.read()
+    frame_count = max(1, int(info.get("frame_count") or 1))
+    index = int(index) % frame_count
+    max_w, max_h = clamp_video_size(max_w, max_h)
+    fps = max(0.25, min(MAX_VIDEO_FPS, float(fps)))
+    max_frames = max(1, min(MAX_VIDEO_FRAMES, int(max_frames)))
+    color_step = max(4, min(64, int(color_step)))
 
-    frames = extract_video_frames(original, raw, os.path.basename(original), "", fps, max_frames)
-    data = build_video_data_from_frames(port, frames, max_w, max_h, color_step, fps, max_frames)
-    atomic_write_json(cache_path, data)
+    cache = video_frame_cache_file(port, index, max_w, max_h, color_step, fps, max_frames)
+    cached = load_json_file(cache)
+    if cached and cached.get("ok"):
+        return cached
+
+    errors: List[str] = []
+    img: Optional[Image.Image] = None
+    decoder = str(info.get("decoder") or "")
+
+    try:
+        if decoder == "pillow" or pil_is_animated(original):
+            img = get_pil_animated_frame(original, index, fps)
+            decoder = "pillow"
+    except Exception as e:
+        errors.append("pillow: " + str(e))
+        img = None
+
+    if img is None:
+        try:
+            img = get_imageio_frame(original, index, fps)
+            decoder = "imageio"
+        except Exception as e:
+            errors.append("imageio: " + str(e))
+            img = None
+
+    if img is None:
+        try:
+            img = get_cv2_frame(original, index, fps)
+            decoder = "cv2"
+        except Exception as e:
+            errors.append("cv2: " + str(e))
+            img = None
+
+    if img is None:
+        return {
+            "ok": False,
+            "type": "video_frame",
+            "port": clean_port(port),
+            "error": "Could not decode frame: " + " | ".join(errors[:3]),
+        }
+
+    target = (int(info.get("width") or 0), int(info.get("height") or 0))
+    w, h, pixels = frame_to_hex_pixels(img, max_w, max_h, color_step, target if target[0] > 0 and target[1] > 0 else None)
+    data = {
+        "ok": True,
+        "type": "video_frame_cache",
+        "port": clean_port(port),
+        "index": index,
+        "width": w,
+        "height": h,
+        "fps": fps,
+        "frame_count": frame_count,
+        "pixel_count": w * h,
+        "color_step": color_step,
+        "decoder": decoder,
+        "pixels": pixels,
+    }
+    atomic_write_json(cache, data)
     return data
 
 
-def video_meta_response(data: Dict[str, Any]) -> Dict[str, Any]:
-    if data.get("ok") is not True:
-        return data
-    return {
-        "ok": True,
-        "type": "video",
-        "port": data.get("port"),
-        "width": data.get("width"),
-        "height": data.get("height"),
-        "fps": data.get("fps"),
-        "frame_count": data.get("frame_count"),
-        "max_frames": data.get("max_frames"),
-        "color_step": data.get("color_step"),
-        "pixel_count": data.get("pixel_count"),
-        "created_at": data.get("created_at"),
-    }
+def video_frame_response(current: Dict[str, Any], previous: Optional[Dict[str, Any]], prev_index: Optional[int]) -> Dict[str, Any]:
+    if current.get("ok") is not True:
+        current["type"] = "video_frame"
+        return current
 
-
-def video_frame_response(data: Dict[str, Any], index: int, prev: Optional[int]) -> Dict[str, Any]:
-    if data.get("ok") is not True:
-        return data
-
-    frames = data.get("frames") or []
-    count = len(frames)
-    if count <= 0:
-        return {"ok": False, "error": "No video frames", "port": data.get("port")}
-
-    index = int(index) % count
-    pixels = str(frames[index].get("pixels") or "")
-    total_pixels = int(data.get("pixel_count") or 0)
-
+    pixels = str(current.get("pixels") or "")
+    total_pixels = int(current.get("pixel_count") or 0)
     out = {
         "ok": True,
         "type": "video_frame",
-        "port": data.get("port"),
-        "width": data.get("width"),
-        "height": data.get("height"),
-        "fps": data.get("fps"),
-        "frame_count": count,
-        "index": index,
+        "port": current.get("port"),
+        "width": current.get("width"),
+        "height": current.get("height"),
+        "fps": current.get("fps"),
+        "frame_count": current.get("frame_count"),
+        "index": current.get("index"),
         "pixel_count": total_pixels,
-        "color_step": data.get("color_step"),
+        "color_step": current.get("color_step"),
     }
 
-    if prev is None or prev < 0 or prev >= count:
+    if previous is None or previous.get("ok") is not True or int(previous.get("index") or -1) != int(prev_index if prev_index is not None else -2):
         out["full"] = True
         out["pixels"] = pixels
         out["change_count"] = total_pixels
         return out
 
-    prev_pixels = str(frames[int(prev)].get("pixels") or "")
+    prev_pixels = str(previous.get("pixels") or "")
+    if len(prev_pixels) != len(pixels):
+        out["full"] = True
+        out["pixels"] = pixels
+        out["change_count"] = total_pixels
+        return out
+
     changes = []
     for i in range(total_pixels):
-        a = i * 6
-        color = pixels[a:a + 6]
-        if color != prev_pixels[a:a + 6]:
+        start = i * 6
+        color = pixels[start:start + 6]
+        if color != prev_pixels[start:start + 6]:
             changes.append([i + 1, color])
 
     if len(changes) > total_pixels * 0.82:
@@ -635,7 +717,6 @@ def video_frame_response(data: Dict[str, Any], index: int, prev: Optional[int]) 
         out["full"] = False
         out["changes"] = changes
         out["change_count"] = len(changes)
-
     return out
 
 
@@ -643,43 +724,26 @@ def video_frame_response(data: Dict[str, Any], index: int, prev: Optional[int]) 
 def index():
     port = request.args.get("port", "").strip()
     status = "<span class='bad'>No port</span>"
-
     if port:
         try:
             clean = clean_port(port)
-            image_data = load_cached_latest(clean)
-            video_path = find_video_original(clean)
             parts = []
+            image_data = load_cached_latest_image(clean)
             if image_data.get("ok"):
                 parts.append(
-                    f"<span class='ok'>Image ready: {image_data.get('port')}</span><br>"
+                    f"<span class='ok'>Image ready: {clean}</span><br>"
                     f"{image_data.get('width')}x{image_data.get('height')} · Rects: {image_data.get('rect_count')}"
                 )
+            video_path = find_video_original(clean)
             if video_path:
-                try:
-                    vdata = load_or_make_video_data(clean, DEFAULT_VIDEO_RES, DEFAULT_VIDEO_RES, DEFAULT_COLOR_STEP, DEFAULT_VIDEO_FPS, MAX_VIDEO_FRAMES)
-                    if vdata.get("ok"):
-                        parts.append(
-                            f"<span class='ok'>Video ready: {clean}</span><br>"
-                            f"{vdata.get('width')}x{vdata.get('height')} · Frames: {vdata.get('frame_count')} · FPS: {vdata.get('fps')}"
-                        )
-                except Exception as e:
-                    parts.append(f"<span class='bad'>Video saved, conversion error: {e}</span>")
-            if parts:
-                status = "<br><br>".join(parts)
-            else:
-                status = "<span class='bad'>No image/video on this port</span>"
+                parts.append(
+                    f"<span class='ok'>Video saved: {clean}</span><br>"
+                    f"{os.path.basename(video_path)} · open Roblox script and press Video Preview / Build Canvas"
+                )
+            status = "<br><br>".join(parts) if parts else "<span class='bad'>No image/video on this port</span>"
         except Exception as e:
             status = f"<span class='bad'>{e}</span>"
-
-    return render_template_string(
-        HTML,
-        status=status,
-        port=port,
-        show_key=bool(IMAGE_KEY),
-        default_fps=DEFAULT_VIDEO_FPS,
-        max_frames=MAX_VIDEO_FRAMES,
-    )
+    return render_template_string(HTML, status=status, port=port, show_key=bool(IMAGE_KEY), default_fps=DEFAULT_VIDEO_FPS, max_frames=MAX_VIDEO_FRAMES)
 
 
 @app.route("/upload", methods=["POST"])
@@ -695,51 +759,52 @@ def upload():
     raw = uploaded.read()
     filename = uploaded.filename or "upload.bin"
     mimetype = uploaded.mimetype or ""
-
     if not raw:
         return json_error("Empty file", 400)
 
-    should_video = is_probably_video(filename, mimetype) or pil_is_animated_image(raw)
+    should_video = is_probably_video(filename, mimetype)
+    if not should_video:
+        try:
+            tmp = Image.open(BytesIO(raw))
+            should_video = bool(getattr(tmp, "is_animated", False) and getattr(tmp, "n_frames", 1) > 1)
+        except Exception:
+            should_video = False
 
     if should_video:
-        fps = read_float("video_fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
-        max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
-        max_w, max_h = clamp_video_size(DEFAULT_VIDEO_RES, DEFAULT_VIDEO_RES)
+        for old in glob.glob(os.path.join(VIDEO_ORIGINAL_DIR, f"{port}.*")) + glob.glob(os.path.join(VIDEO_CACHE_DIR, f"{port}_*.json")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
         path = video_original_file(port, filename)
-
-        for old in glob.glob(os.path.join(VIDEO_ORIGINAL_DIR, f"{port}.*")):
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-        for old in glob.glob(os.path.join(VIDEO_DIR, f"{port}_*.json")):
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-
         atomic_write(path, raw)
-        try:
-            frames = extract_video_frames(path, raw, filename, mimetype, fps, max_frames)
-            data = build_video_data_from_frames(port, frames, max_w, max_h, DEFAULT_COLOR_STEP, fps, max_frames)
-            atomic_write_json(video_cache_file(port, max_w, max_h, DEFAULT_COLOR_STEP, fps, max_frames), data)
-        except Exception as e:
-            return json_error("Video saved, conversion failed: " + str(e), 200, {"port": port, "type": "video"})
-
+        info = {
+            "ok": True,
+            "type": "video_saved",
+            "port": port,
+            "filename": os.path.basename(path),
+            "size_bytes": len(raw),
+            "created_at": int(time.time()),
+            "video_fps": read_float("video_fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS),
+            "max_frames": read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES),
+        }
+        atomic_write_json(video_info_file(port), info)
         return f"""
         <body style="background:#111;color:white;font-family:Arial;padding:24px">
-            <h2>Video uploaded</h2>
+            <h2>Video saved</h2>
             <p>Port: {port}</p>
-            <p>Frames: {data.get('frame_count')} · Size: {data.get('width')}x{data.get('height')} · FPS: {data.get('fps')}</p>
+            <p>Now open Roblox script and press <b>video preview</b> or <b>build canvas</b>.</p>
+            <p>Frames will be decoded lazily, so upload should not crash Render.</p>
             <p><a style="color:#00aaff" href="/?port={port}">Back</a></p>
         </body>
         """
 
-    save_original(port, raw)
+    atomic_write(image_original_file(port), raw)
     try:
         img = Image.open(BytesIO(raw))
         img.load()
-        save_latest(port, image_to_rects_safe(img, DEFAULT_RES, DEFAULT_RES, DEFAULT_COLOR_STEP))
+        data = image_to_rects_safe(img, DEFAULT_RES, DEFAULT_RES, DEFAULT_COLOR_STEP)
+        save_latest_image(port, data)
     except Exception as e:
         return json_error("Saved, conversion failed: " + str(e), 200, {"port": port, "type": "image"})
 
@@ -756,25 +821,19 @@ def upload():
 def latest():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
-
     port = clean_port(request.args.get("port", ""))
     max_w = read_int("max_w", DEFAULT_RES, 8, ABS_MAX_RES)
     max_h = read_int("max_h", DEFAULT_RES, 8, ABS_MAX_RES)
     color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
-
     try:
-        data = load_original_as_rects(port, max_w, max_h, color_step)
+        data = load_original_image_as_rects(port, max_w, max_h, color_step)
     except Exception as e:
-        data = load_cached_latest(port)
+        data = load_cached_latest_image(port)
         data["warning"] = "Cached"
         data["server_error"] = str(e)
-
     if data is None:
-        data = load_cached_latest(port)
-
-    resp = jsonify(data)
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+        data = load_cached_latest_image(port)
+    return json_response(data)
 
 
 @app.route("/video/meta", methods=["GET"])
@@ -782,25 +841,20 @@ def latest():
 def video_meta():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
-
     port = clean_port(request.args.get("port", ""))
     max_w = read_int("max_w", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
     max_h = read_int("max_h", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
     color_step = read_int("color_step", DEFAULT_COLOR_STEP, 4, 64)
     fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
     max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
-
-    data = load_or_make_video_data(port, max_w, max_h, color_step, fps, max_frames)
-    resp = jsonify(video_meta_response(data))
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+    data = get_video_info(port, max_w, max_h, color_step, fps, max_frames)
+    return json_response(data)
 
 
 @app.route("/video/frame", methods=["GET"])
 def video_frame():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
-
     port = clean_port(request.args.get("port", ""))
     max_w = read_int("max_w", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
     max_h = read_int("max_h", DEFAULT_VIDEO_RES, 8, ABS_MAX_RES)
@@ -808,50 +862,76 @@ def video_frame():
     fps = read_float("fps", DEFAULT_VIDEO_FPS, 0.25, MAX_VIDEO_FPS)
     max_frames = read_int("max_frames", MAX_VIDEO_FRAMES, 1, MAX_VIDEO_FRAMES)
     index = read_int("index", 0, 0, 1000000)
-
-    prev_arg = request.args.get("prev", None)
+    prev_arg = request.args.get("prev")
     try:
         prev = None if prev_arg in (None, "", "nil", "none") else int(prev_arg)
     except Exception:
         prev = None
 
-    data = load_or_make_video_data(port, max_w, max_h, color_step, fps, max_frames)
-    resp = jsonify(video_frame_response(data, index, prev))
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+    info = get_video_info(port, max_w, max_h, color_step, fps, max_frames)
+    if info.get("ok") is not True:
+        return json_response({"ok": False, "type": "video_frame", "port": port, "error": info.get("error", "Video not ready")})
+
+    current = decode_video_frame(port, index, info, max_w, max_h, color_step, fps, max_frames)
+    previous = None
+    if prev is not None and prev >= 0:
+        previous = decode_video_frame(port, prev, info, max_w, max_h, color_step, fps, max_frames)
+    return json_response(video_frame_response(current, previous, prev))
 
 
 @app.route("/clear", methods=["POST", "GET"])
 def clear():
     if IMAGE_KEY and not check_key(request):
         return json_error("Bad key", 403)
-
     port = clean_port(request.values.get("port", ""))
-    paths = [port_file(port), original_file(port)]
+    paths = [image_json_file(port), image_original_file(port), video_info_file(port)]
     paths += glob.glob(os.path.join(VIDEO_ORIGINAL_DIR, f"{port}.*"))
-    paths += glob.glob(os.path.join(VIDEO_DIR, f"{port}_*.json"))
-
+    paths += glob.glob(os.path.join(VIDEO_CACHE_DIR, f"{port}_*.json"))
     for path in paths:
         if os.path.exists(path):
-            os.remove(path)
-
-    return jsonify({"ok": True, "message": "Cleared", "port": port})
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return json_response({"ok": True, "message": "Cleared", "port": port})
 
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({
+    return json_response({
         "ok": True,
         "time": int(time.time()),
-        "service": "image-video-painter-minimal",
+        "service": "image-video-painter-lazy-no500",
         "abs_max_res": ABS_MAX_RES,
         "max_rects": MAX_RECTS,
         "video": True,
+        "lazy_video": True,
         "default_video_fps": DEFAULT_VIDEO_FPS,
         "max_video_fps": MAX_VIDEO_FPS,
         "max_video_frames": MAX_VIDEO_FRAMES,
         "video_max_pixels": VIDEO_MAX_PIXELS,
     })
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    libs = {}
+    try:
+        import imageio  # type: ignore
+        libs["imageio"] = getattr(imageio, "__version__", "installed")
+    except Exception as e:
+        libs["imageio"] = "missing: " + str(e)
+    try:
+        import imageio_ffmpeg  # type: ignore
+        libs["imageio_ffmpeg"] = getattr(imageio_ffmpeg, "__version__", "installed")
+    except Exception as e:
+        libs["imageio_ffmpeg"] = "missing: " + str(e)
+    try:
+        import cv2  # type: ignore
+        libs["cv2"] = getattr(cv2, "__version__", "installed")
+    except Exception as e:
+        libs["cv2"] = "missing: " + str(e)
+    return json_response({"ok": True, "libs": libs, "time": int(time.time())})
 
 
 if __name__ == "__main__":
