@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v8-get-2026-07-11"
+APP_VERSION = "model-search-v9-download-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -1335,7 +1335,7 @@ def find_download_location(payload: Any) -> Optional[str]:
 
 
 def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
-    head = raw[:256].lstrip()
+    head = raw[:512].lstrip()
     lower = head.lower()
     if head.startswith(b"<roblox!"):
         return ".rbxm", "application/octet-stream"
@@ -1348,61 +1348,144 @@ def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
     raise RuntimeError("The downloaded asset is not a recognized RBXM/RBXMX model")
 
 
+def roblox_payload_error(payload: Any) -> str:
+    if not isinstance(payload, (dict, list)):
+        return ""
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            messages = []
+            for item in errors:
+                if isinstance(item, dict):
+                    message = item.get("message") or item.get("userFacingMessage") or item.get("code")
+                    if message is not None:
+                        messages.append(str(message))
+                elif item is not None:
+                    messages.append(str(item))
+            if messages:
+                return "; ".join(messages)[:400]
+        for key in ("error", "message", "userFacingMessage", "statusMessage"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:400]
+        for value in payload.values():
+            found = roblox_payload_error(value)
+            if found:
+                return found
+    else:
+        for value in payload:
+            found = roblox_payload_error(value)
+            if found:
+                return found
+    return ""
+
+
+def fetch_roblox_asset_response(url: str, headers: Dict[str, str], max_hops: int = 4) -> bytes:
+    current_url = url
+    current_headers = dict(headers)
+
+    for _ in range(max_hops):
+        response = requests.get(
+            current_url,
+            headers=current_headers,
+            timeout=(7, ROBLOX_HTTP_TIMEOUT),
+            allow_redirects=False,
+            stream=True,
+        )
+
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "").strip()
+            response.close()
+            if not location or not trusted_roblox_location(location):
+                raise RuntimeError("Roblox returned an unsafe or empty redirect")
+            current_url = location
+            current_headers = {
+                "Accept": "*/*",
+                "User-Agent": "NamelessTools/1.0",
+            }
+            continue
+
+        raw = read_limited_response(response)
+        content_type = response.headers.get("Content-Type", "").lower()
+        status_code = response.status_code
+        response.close()
+
+        is_json = "json" in content_type or raw.lstrip()[:1] in (b"{", b"[")
+        if is_json:
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                payload = None
+
+            location = find_download_location(payload)
+            if location:
+                current_url = location
+                current_headers = {
+                    "Accept": "*/*",
+                    "User-Agent": "NamelessTools/1.0",
+                }
+                continue
+
+            detail = roblox_payload_error(payload)
+            if status_code >= 400:
+                raise RuntimeError(f"HTTP {status_code}: {detail or 'request failed'}")
+            raise RuntimeError(detail or "Roblox returned JSON without a model download URL")
+
+        if status_code >= 400:
+            detail = raw[:300].decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"HTTP {status_code}: {detail or 'request failed'}")
+
+        return raw
+
+    raise RuntimeError("Too many Roblox download redirects")
+
+
 def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
-    candidates = []
+    public_headers = {
+        "Accept": "*/*",
+        "User-Agent": "NamelessTools/1.0",
+    }
+    candidates = [
+        (
+            f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}",
+            public_headers,
+            "legacy v1 asset query",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
+            public_headers,
+            "asset delivery v2",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
+            public_headers,
+            "legacy v1 assetId",
+        ),
+    ]
+
     if ROBLOX_OPEN_CLOUD_KEY:
         candidates.append((
             f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
-            roblox_headers(),
+            {
+                "Accept": "*/*",
+                "User-Agent": "NamelessTools/1.0",
+                "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+            },
+            "Open Cloud asset delivery",
         ))
-    candidates.extend([
-        (f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
-        (f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
-    ])
+
     errors = []
-    for url, headers in candidates:
+    for url, headers, label in candidates:
         try:
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=(7, ROBLOX_HTTP_TIMEOUT),
-                allow_redirects=True,
-                stream=True,
-            )
-            if response.status_code >= 400:
-                errors.append(f"HTTP {response.status_code}")
-                response.close()
-                continue
-            content_type = response.headers.get("Content-Type", "").lower()
-            raw = read_limited_response(response)
-            response.close()
-            if "json" in content_type or raw[:1] in (b"{", b"["):
-                try:
-                    payload = json.loads(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    payload = None
-                location = find_download_location(payload)
-                if location:
-                    follow = requests.get(
-                        location,
-                        headers={"User-Agent": "NamelessTools/1.0"},
-                        timeout=(7, ROBLOX_HTTP_TIMEOUT),
-                        allow_redirects=True,
-                        stream=True,
-                    )
-                    if follow.status_code >= 400:
-                        errors.append(f"CDN HTTP {follow.status_code}")
-                        follow.close()
-                        continue
-                    raw = read_limited_response(follow)
-                    follow.close()
+            raw = fetch_roblox_asset_response(url, headers)
             extension, mime = classify_model_bytes(raw)
             return raw, extension, mime
         except Exception as e:
-            errors.append(str(e))
-    message = errors[-1] if errors else "Roblox did not return the model"
-    raise RuntimeError(message)
+            errors.append(f"{label}: {e}")
 
+    if not errors:
+        raise RuntimeError("Roblox did not return the model")
+    raise RuntimeError(" | ".join(errors[-4:]))
 
 def safe_download_name(asset_id: int, extension: str) -> str:
     return f"roblox_model_{asset_id}{extension}"
