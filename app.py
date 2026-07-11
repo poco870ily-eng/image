@@ -20,7 +20,7 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v12-legacy-asset-download-2026-07-11"
+APP_VERSION = "model-search-v15-restored-download-fallback-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -233,7 +233,7 @@ HTML = r'''
                     <div id="modelPageLabel" class="model-page-label">Page 1</div>
                     <button id="modelNextBtn" type="button" class="secondary">Next</button>
                 </div>
-                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. Downloading also requires Asset Delivery permission on the Open Cloud key.</div>
+                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. The downloader tries the same legacy Asset Delivery fallbacks used by the early working version.</div>
             </div>
         </div>
     </div>
@@ -1510,6 +1510,11 @@ def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> 
                 follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
             return fetch_from_asset_endpoint(location, follow_headers, label + " redirect")
 
+        if response.status_code in (401, 403) and "apis.roblox.com" in url:
+            raise PermissionError(
+                "The Open Cloud key can search but cannot download assets. "
+                "Add Asset Delivery access (legacy-asset:manage) to ROBLOX_OPEN_CLOUD_KEY, then redeploy."
+            )
         if response.status_code >= 400:
             detail = response_error_text(response)
             raise RuntimeError(f"{label} returned HTTP {response.status_code}: {detail or 'request failed'}")
@@ -1540,20 +1545,66 @@ def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> 
 
 
 def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
-    legacy_url = f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}"
-    return fetch_from_asset_endpoint(
-        legacy_url,
-        {
-            "Accept": "*/*",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-        },
-        "Roblox legacy Asset Delivery",
-    )
+    # Restored from the early working downloader: never stop after an
+    # Open Cloud 401/403. Try every Asset Delivery variant in sequence.
+    candidates: List[Tuple[str, Dict[str, str], str]] = []
 
+    if ROBLOX_OPEN_CLOUD_KEY:
+        candidates.append((
+            f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Open Cloud Asset Delivery",
+        ))
+
+    candidates.extend([
+        (
+            f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox Asset Delivery v2",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox Asset Delivery v1 assetId",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox legacy Asset Delivery",
+        ),
+    ])
+
+    errors: List[str] = []
+    for url, headers, label in candidates:
+        try:
+            return fetch_from_asset_endpoint(url, headers, label)
+        except Exception as exc:
+            # This is the important early-version behavior: continue to the
+            # next endpoint instead of forcing legacy-asset:manage.
+            errors.append(str(exc))
+            continue
+
+    if errors:
+        # Keep all endpoint results visible so it is clear which one failed.
+        unique: List[str] = []
+        for error in errors:
+            if error and error not in unique:
+                unique.append(error)
+        raise RuntimeError(" | ".join(unique[-4:]))
+    raise RuntimeError("Roblox did not return the model")
 
 def cleanup_model_downloads() -> None:
     cutoff = time.time() - MODEL_DOWNLOAD_TTL
@@ -1752,9 +1803,14 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
-        "download_flow": "legacy v1 asset -> local attachment",
-        "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
-        "download_uses_open_cloud_key": False,
+        "download_flow": "early fallback chain -> local attachment",
+        "download_endpoints": [
+            "Open Cloud assetId (optional)",
+            "legacy v2/assetId",
+            "legacy v1/assetId",
+            "legacy v1/asset?id="
+        ],
+        "continues_after_open_cloud_403": True,
         "asset_id_priority": "assetId before id",
         "search_category_type": "Model",
         "model_asset_type": 10,
