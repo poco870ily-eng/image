@@ -8,11 +8,14 @@ import secrets
 import struct
 import time
 import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote_plus, urlparse
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 from flask import Flask, Response, jsonify, render_template_string, request, session
 from PIL import Image, ImageFile
 
@@ -22,7 +25,7 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v20-meshpart-store-text-fix-2026-07-12"
+APP_VERSION = "model-search-v22-fast-batch-mesh-check-2026-07-12"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -38,8 +41,12 @@ MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", 
 MESH_SCAN_CACHE_DIR = os.environ.get("MESH_SCAN_CACHE_DIR", "mesh_scan_cache")
 MESH_SCAN_EXACT_TTL = max(3600, min(2592000, int(os.environ.get("MESH_SCAN_EXACT_TTL", "604800"))))
 MESH_SCAN_UNKNOWN_TTL = max(60, min(86400, int(os.environ.get("MESH_SCAN_UNKNOWN_TTL", "900"))))
-MESH_DETAILS_SOURCE = "creator_store_technical_details_v4"
-STORE_PAGE_MAX_BYTES = max(250000, min(8000000, int(os.environ.get("STORE_PAGE_MAX_BYTES", "4000000"))))
+MESH_DETAILS_SOURCE = "creator_store_fast_batch_v6"
+STORE_PAGE_MAX_BYTES = max(250000, min(4000000, int(os.environ.get("STORE_PAGE_MAX_BYTES", "1500000"))))
+MESH_CHECK_WORKERS = max(4, min(16, int(os.environ.get("MESH_CHECK_WORKERS", "10"))))
+MESH_FAST_CONNECT_TIMEOUT = max(2, min(10, int(os.environ.get("MESH_FAST_CONNECT_TIMEOUT", "4"))))
+MESH_FAST_READ_TIMEOUT = max(4, min(20, int(os.environ.get("MESH_FAST_READ_TIMEOUT", "10"))))
+_mesh_http_local = threading.local()
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -484,15 +491,53 @@ async function checkOneModelMesh(model, generation) {
 }
 async function checkModelMeshes(models) {
     const generation = ++state.meshScanGeneration;
-    const queue = Array.isArray(models) ? models.slice() : [];
-    updateMeshSummary();
-    const worker = async () => {
-        while (queue.length && generation === state.meshScanGeneration) {
-            const model = queue.shift();
-            await checkOneModelMesh(model, generation);
+    const pending = [];
+    (Array.isArray(models) ? models : []).forEach(model => {
+        const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
+        if (!assetId) return;
+        const includedCount = Number(model && model.mesh_part_count);
+        if (model && model.mesh_part_count !== null && model.mesh_part_count !== undefined && Number.isFinite(includedCount) && includedCount >= 0) {
+            const fixedCount = Math.floor(includedCount);
+            setCardMeshStatus(assetId, fixedCount > 0 ? 'has_mesh' : 'no_mesh', fixedCount, 'Returned by Creator Store search.');
+        } else {
+            pending.push({ id: assetId, name: safeText(model && model.name ? model.name : '') });
         }
-    };
-    await Promise.all([worker(), worker(), worker(), worker()]);
+    });
+    if (!pending.length || generation !== state.meshScanGeneration) {
+        updateMeshSummary();
+        return;
+    }
+    try {
+        const res = await fetch('/admin/models/mesh-status-batch', {
+            method: 'POST',
+            cache: 'no-store',
+            headers: adminHeaders({ 'Accept': 'application/json', 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ models: pending })
+        });
+        const data = await parseJson(res);
+        if (generation !== state.meshScanGeneration) return;
+        if (!res.ok || !data.ok) throw new Error(data.error || 'MeshPart batch request failed');
+        const results = Array.isArray(data.results) ? data.results : [];
+        results.forEach(item => {
+            if (generation !== state.meshScanGeneration) return;
+            setCardMeshStatus(
+                safeText(item.asset_id || ''),
+                safeText(item.status || 'unknown'),
+                item.mesh_part_count,
+                safeText(item.reason || '')
+            );
+        });
+    } catch (e) {
+        if (generation !== state.meshScanGeneration) return;
+        const queue = pending.slice();
+        const worker = async () => {
+            while (queue.length && generation === state.meshScanGeneration) {
+                const item = queue.shift();
+                await checkOneModelMesh({ id: item.id, name: item.name }, generation);
+            }
+        };
+        await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
+    }
     if (generation === state.meshScanGeneration) updateMeshSummary();
 }
 
@@ -1845,40 +1890,18 @@ def find_mesh_part_count(payload: Any) -> Optional[int]:
     return None
 
 
-def safe_get_roblox_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    headers = {"Accept": "application/json", "User-Agent": "NamelessTools/1.0"}
-    if ROBLOX_OPEN_CLOUD_KEY:
-        headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
-    response = requests.get(url, params=params or {}, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False)
-    if response.status_code in (301, 302, 303, 307, 308):
-        location = response.headers.get("Location", "")
-        parsed = urlparse(location)
-        if parsed.scheme != "https" or parsed.hostname != "apis.roblox.com":
-            raise RuntimeError("unsafe details redirect")
-        response = requests.get(location, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False)
-    if response.status_code >= 400:
-        message = response.text[:250].strip()
-        raise RuntimeError(f"HTTP {response.status_code}: {message or 'request failed'}")
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise RuntimeError("invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("unexpected JSON shape")
-    return payload
-
-
-def fetch_creator_store_asset_details_v2(asset_id: int) -> Dict[str, Any]:
-    if not ROBLOX_OPEN_CLOUD_KEY:
-        raise RuntimeError("Open Cloud key is not configured")
-    return safe_get_roblox_json(f"https://apis.roblox.com/toolbox-service/v2/assets/{int(asset_id)}")
-
-
-def fetch_creator_store_item_details_v1(asset_id: int) -> Dict[str, Any]:
-    return safe_get_roblox_json(
-        "https://apis.roblox.com/toolbox-service/v1/items/details",
-        {"assetIds": str(int(asset_id))},
-    )
+def get_mesh_http_session() -> requests.Session:
+    session = getattr(_mesh_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0, pool_block=False)
+        session.mount("https://", adapter)
+        session.headers.update({
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        })
+        _mesh_http_local.session = session
+    return session
 
 
 def trusted_creator_store_page(url: str) -> bool:
@@ -1908,68 +1931,50 @@ def read_limited_text_response(response, max_bytes: int = STORE_PAGE_MAX_BYTES) 
     return raw.decode(response.encoding or "utf-8", errors="replace")
 
 
-def fetch_creator_store_direct_page(asset_id: int, asset_name: str = "") -> str:
+def fetch_creator_store_fast_direct_page(asset_id: int, asset_name: str = "") -> str:
     slug = creator_store_slug(asset_name)
-    urls = [
-        f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}",
-        f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}/reviews",
-        f"https://create.roblox.com/store/asset/{int(asset_id)}",
-    ]
-    user_agents = [
-        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    ]
-    errors: List[str] = []
-    for initial_url in urls:
-        for user_agent in user_agents:
-            url = initial_url
-            try:
-                for _ in range(4):
-                    response = requests.get(
-                        url,
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Cache-Control": "no-cache",
-                            "User-Agent": user_agent,
-                        },
-                        timeout=(7, ROBLOX_HTTP_TIMEOUT),
-                        allow_redirects=False,
-                        stream=True,
-                    )
-                    try:
-                        if response.status_code in (301, 302, 303, 307, 308):
-                            location = response.headers.get("Location", "")
-                            if location.startswith("/"):
-                                location = "https://create.roblox.com" + location
-                            if not trusted_creator_store_page(location):
-                                raise RuntimeError("unsafe Store redirect")
-                            url = location
-                            continue
-                        if response.status_code >= 400:
-                            raise RuntimeError(f"HTTP {response.status_code}")
-                        return read_limited_text_response(response)
-                    finally:
-                        response.close()
-            except Exception as exc:
-                errors.append(str(exc))
-    raise RuntimeError("direct Store page failed: " + "; ".join(errors[-3:]))
+    url = f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}"
+    session = get_mesh_http_session()
+    response = session.get(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+        },
+        timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
+        allow_redirects=False,
+        stream=True,
+    )
+    try:
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "")
+            if location.startswith("/"):
+                location = "https://create.roblox.com" + location
+            if not trusted_creator_store_page(location):
+                raise RuntimeError("unsafe Store redirect")
+            response.close()
+            response = session.get(
+                location,
+                headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+                timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
+                allow_redirects=False,
+                stream=True,
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        return read_limited_text_response(response)
+    finally:
+        response.close()
 
 
 def fetch_creator_store_reader_text(asset_id: int, asset_name: str = "") -> str:
-    # Public text-rendering fallback. Only the public Creator Store URL is sent.
     slug = creator_store_slug(asset_name)
-    target = f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}"
     reader_url = "https://r.jina.ai/https://create.roblox.com/store/asset/" + str(int(asset_id)) + "/" + slug
-    response = requests.get(
+    session = get_mesh_http_session()
+    response = session.get(
         reader_url,
-        headers={
-            "Accept": "text/plain,text/markdown,*/*;q=0.8",
-            "User-Agent": "NamelessTools/1.0",
-            "X-Target-URL": target,
-        },
-        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        headers={"Accept": "text/plain,text/markdown,*/*;q=0.8", "Cache-Control": "no-cache"},
+        timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
         allow_redirects=False,
         stream=True,
     )
@@ -1979,7 +1984,6 @@ def fetch_creator_store_reader_text(asset_id: int, asset_name: str = "") -> str:
         return read_limited_text_response(response)
     finally:
         response.close()
-
 
 def decode_store_embedded_text(page_text: str) -> str:
     decoded = str(page_text or "")
@@ -2001,6 +2005,50 @@ def decode_store_embedded_text(page_text: str) -> str:
         if decoded == before:
             break
     return decoded
+
+
+def store_page_confirms_model_details(page_text: str, asset_id: int) -> bool:
+    if not page_text:
+        return False
+    decoded = decode_store_embedded_text(page_text)
+    visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", decoded, flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(r"<[^>]*>", " ", visible)
+    visible = re.sub(r"[`*_#|\[\]()]", " ", visible)
+    visible = re.sub(r"\s+", " ", visible).strip().lower()
+    decoded_lower = decoded.lower()
+
+    blocked_markers = (
+        "page not found",
+        "asset not found",
+        "access denied",
+        "not authorised",
+        "not authorized",
+        "captcha",
+        "too many requests",
+        "something went wrong",
+    )
+    if any(marker in visible for marker in blocked_markers):
+        return False
+
+    detail_markers = (
+        "contains scripts",
+        "reviews",
+        "created",
+        "updated",
+        "triangle count",
+        "vertices count",
+        "script count",
+        "audio count",
+        "model details",
+    )
+    marker_count = sum(1 for marker in detail_markers if marker in visible)
+    has_model_details = "model details" in visible
+    has_asset_url = f"/store/asset/{int(asset_id)}" in decoded_lower
+
+    # A real Store model page always exposes several Model Details fields.
+    # Roblox omits the MeshPart Count row entirely when its value is zero.
+    return (has_model_details and marker_count >= 3) or (has_asset_url and marker_count >= 4)
 
 
 def find_mesh_part_count_in_store_html(page_html: str) -> Optional[int]:
@@ -2037,54 +2085,48 @@ def get_model_mesh_status(asset_id: int, asset_name: str = "", force: bool = Fal
         if cached:
             cached["cached"] = True
             return cached
+
     attempts: List[str] = []
     count: Optional[int] = None
     source = ""
+
+    # Fast path: the rendered public Store text contains the same technical
+    # details shown in the browser and is usually cached upstream.
     try:
-        details = fetch_creator_store_asset_details_v2(asset_id)
-        count = find_mesh_part_count(details)
+        reader_text = fetch_creator_store_reader_text(asset_id, asset_name)
+        count = find_mesh_part_count_in_store_html(reader_text)
         if count is not None:
-            source = "creator_store_asset_details_v2"
+            source = "creator_store_reader_fast"
+        elif store_page_confirms_model_details(reader_text, asset_id):
+            count = 0
+            source = "creator_store_reader_missing_row_means_zero"
         else:
-            attempts.append("v2 details had no MeshPart Count")
+            attempts.append("reader text had no recognizable Model Details")
     except Exception as exc:
-        attempts.append("v2 details " + str(exc))
+        attempts.append("reader " + str(exc))
+
+    # One direct Store request is kept only as a fallback. Older versions made
+    # many requests with several URLs and user agents, which caused the delay.
     if count is None:
         try:
-            details = fetch_creator_store_item_details_v1(asset_id)
-            count = find_mesh_part_count(details)
-            if count is not None:
-                source = "creator_store_item_details_v1"
-            else:
-                attempts.append("v1 item details had no MeshPart Count")
-        except Exception as exc:
-            attempts.append("v1 item details " + str(exc))
-    if count is None:
-        try:
-            page_html = fetch_creator_store_direct_page(asset_id, asset_name)
+            page_html = fetch_creator_store_fast_direct_page(asset_id, asset_name)
             count = find_mesh_part_count_in_store_html(page_html)
             if count is not None:
-                source = "creator_store_page_direct"
+                source = "creator_store_direct_fast"
+            elif store_page_confirms_model_details(page_html, asset_id):
+                count = 0
+                source = "creator_store_direct_missing_row_means_zero"
             else:
-                attempts.append("direct Store page had no MeshPart Count")
+                attempts.append("direct Store page had no recognizable Model Details")
         except Exception as exc:
-            attempts.append("direct Store page " + str(exc))
-    if count is None:
-        try:
-            reader_text = fetch_creator_store_reader_text(asset_id, asset_name)
-            count = find_mesh_part_count_in_store_html(reader_text)
-            if count is not None:
-                source = "creator_store_page_reader"
-            else:
-                attempts.append("rendered Store text had no MeshPart Count")
-        except Exception as exc:
-            attempts.append("rendered Store text " + str(exc))
+            attempts.append("direct " + str(exc))
+
     if count is None:
         result = {
             "status": "unknown",
             "mesh_part_count": None,
             "reason": "; ".join(attempts)[:900] or "MeshPart Count was not returned",
-            "source": "creator_store_technical_details",
+            "source": "creator_store_fast_batch",
         }
     else:
         result = {
@@ -2095,7 +2137,6 @@ def get_model_mesh_status(asset_id: int, asset_name: str = "", force: bool = Fal
         }
     result["cached"] = False
     return save_mesh_scan_cache(asset_id, result)
-
 
 def cleanup_model_downloads() -> None:
     cutoff = time.time() - MODEL_DOWNLOAD_TTL
@@ -2214,6 +2255,81 @@ def admin_models_search():
     return response
 
 
+@app.route("/admin/models/mesh-status-batch", methods=["POST"])
+def admin_model_mesh_status_batch():
+    denied = require_admin_response()
+    if denied:
+        return denied
+    body = request.get_json(silent=True)
+    raw_models = body.get("models", []) if isinstance(body, dict) else []
+    if not isinstance(raw_models, list):
+        return json_error("models must be a list", 400)
+
+    items: List[Tuple[int, str]] = []
+    seen = set()
+    for raw in raw_models[:30]:
+        if not isinstance(raw, dict):
+            continue
+        asset_id_text = re.sub(r"\D+", "", str(raw.get("id", "")))
+        if not asset_id_text:
+            continue
+        asset_id = int(asset_id_text)
+        if asset_id <= 0 or asset_id in seen:
+            continue
+        seen.add(asset_id)
+        items.append((asset_id, str(raw.get("name", "")).strip()[:160]))
+
+    if not items:
+        return jsonify({"ok": True, "results": [], "count": 0, "version": APP_VERSION})
+
+    started = time.time()
+    results_by_id: Dict[int, Dict[str, Any]] = {}
+    workers = min(MESH_CHECK_WORKERS, len(items))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mesh-check") as executor:
+        future_map = {
+            executor.submit(get_model_mesh_status, asset_id, name, False): asset_id
+            for asset_id, name in items
+        }
+        for future in as_completed(future_map):
+            asset_id = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "status": "unknown",
+                    "mesh_part_count": None,
+                    "reason": str(exc),
+                    "source": "batch_exception",
+                    "cached": False,
+                    "checked_at": int(time.time()),
+                }
+            results_by_id[asset_id] = result
+
+    output = []
+    for asset_id, _name in items:
+        result = results_by_id.get(asset_id, {})
+        output.append({
+            "asset_id": asset_id,
+            "status": str(result.get("status", "unknown")),
+            "mesh_part_count": result.get("mesh_part_count"),
+            "reason": str(result.get("reason", "")),
+            "source": str(result.get("source", "creator_store_fast_batch")),
+            "cached": bool(result.get("cached", False)),
+            "checked_at": int(result.get("checked_at", int(time.time()))),
+        })
+
+    response = jsonify({
+        "ok": True,
+        "results": output,
+        "count": len(output),
+        "workers": workers,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "version": APP_VERSION,
+    })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
 @app.route("/admin/models/mesh-status/<asset_id>", methods=["GET"])
 def admin_model_mesh_status(asset_id: str):
     denied = require_admin_response()
@@ -2319,9 +2435,10 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
-        "mesh_detection": "search payload -> Store details -> rendered Store text",
-        "mesh_filter": "only models with confirmed MeshPart Count = 0",
-        "mesh_details_sources": ["search payload", "/toolbox-service/v2/assets/{id}", "/toolbox-service/v1/items/details", "Creator Store page", "rendered public Store text"],
+        "mesh_detection": "search payload -> one batched parallel Store-text check -> one direct fallback; missing MeshPart row on a confirmed model page means 0",
+        "mesh_filter": "models with count 0, including confirmed Store pages where the MeshPart row is omitted",
+        "mesh_details_sources": ["search payload", "batched rendered public Store text", "single direct Creator Store fallback"],
+        "mesh_batch_workers": MESH_CHECK_WORKERS,
         "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_notice": "rename the downloaded file and add .rbxm",
