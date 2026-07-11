@@ -1,4 +1,5 @@
 import hmac
+import html as html_lib
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v18-store-meshpart-count-2026-07-12"
+APP_VERSION = "model-search-v19-store-page-meshpart-fix-2026-07-12"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -37,6 +38,8 @@ MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", 
 MESH_SCAN_CACHE_DIR = os.environ.get("MESH_SCAN_CACHE_DIR", "mesh_scan_cache")
 MESH_SCAN_EXACT_TTL = max(3600, min(2592000, int(os.environ.get("MESH_SCAN_EXACT_TTL", "604800"))))
 MESH_SCAN_UNKNOWN_TTL = max(60, min(86400, int(os.environ.get("MESH_SCAN_UNKNOWN_TTL", "900"))))
+MESH_DETAILS_SOURCE = "creator_store_technical_details_v3"
+STORE_PAGE_MAX_BYTES = max(250000, min(8000000, int(os.environ.get("STORE_PAGE_MAX_BYTES", "4000000"))))
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -1749,10 +1752,7 @@ def load_mesh_scan_cache(asset_id: int) -> Optional[Dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        # Ignore caches created by the older RBXM scanner.
-        if data.get("source") != "creator_store_asset_details":
+        if not isinstance(data, dict) or data.get("source_version") != MESH_DETAILS_SOURCE:
             return None
         count = data.get("mesh_part_count")
         status = str(data.get("status", "unknown"))
@@ -1773,6 +1773,7 @@ def load_mesh_scan_cache(asset_id: int) -> Optional[Dict[str, Any]]:
 def save_mesh_scan_cache(asset_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(result)
     payload["asset_id"] = int(asset_id)
+    payload["source_version"] = MESH_DETAILS_SOURCE
     payload["checked_at"] = int(time.time())
     atomic_write_json(mesh_cache_file(asset_id), payload)
     return payload
@@ -1782,80 +1783,154 @@ def normalize_json_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def find_mesh_part_count(payload: Any) -> Optional[int]:
-    """Find Roblox Store's MeshPart Count even if the response nests it."""
-    wanted = {
-        "meshpartcount",
-        "meshpartscount",
-        "numberofmeshparts",
-        "meshparts",
-    }
-    if isinstance(payload, dict):
-        # Prefer exact keys at the current level before walking nested objects.
-        for key, value in payload.items():
-            if normalize_json_key(key) in wanted:
-                if isinstance(value, bool):
-                    continue
-                try:
-                    count = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if count >= 0:
-                    return count
-        for value in payload.values():
-            found = find_mesh_part_count(value)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for value in payload:
-            found = find_mesh_part_count(value)
-            if found is not None:
-                return found
+def parse_nonnegative_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        cleaned = value.replace("\u00a0", " ").strip()
+        cleaned = re.sub(r"[\s,._]", "", cleaned)
+        if cleaned.isdigit():
+            return int(cleaned)
     return None
 
 
-def fetch_creator_store_asset_details(asset_id: int) -> Dict[str, Any]:
-    if not ROBLOX_OPEN_CLOUD_KEY:
-        raise RuntimeError("ROBLOX_OPEN_CLOUD_KEY is not configured")
-    endpoint = f"https://apis.roblox.com/toolbox-service/v2/assets/{int(asset_id)}"
-    response = requests.get(
-        endpoint,
-        headers={
-            "Accept": "application/json",
-            "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
-            "User-Agent": "NamelessTools/1.0",
-        },
-        timeout=(7, ROBLOX_HTTP_TIMEOUT),
-        allow_redirects=False,
-    )
+def find_mesh_part_count(payload: Any) -> Optional[int]:
+    wanted = {"meshpartcount", "meshpartscount", "numberofmeshparts", "meshpartinstancecount", "meshparts"}
+    label_keys = {"name", "label", "title", "displayname", "metric", "metricname", "stat", "statname", "key", "type"}
+    value_keys = {"value", "count", "amount", "displayvalue", "metricvalue", "statvalue", "total"}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if normalize_json_key(key) in wanted:
+                count = parse_nonnegative_count(value)
+                if count is not None:
+                    return count
+                if isinstance(value, dict):
+                    for nested_key, nested_value in value.items():
+                        if normalize_json_key(nested_key) in value_keys:
+                            count = parse_nonnegative_count(nested_value)
+                            if count is not None:
+                                return count
+        labels = [normalize_json_key(value) for key, value in payload.items() if normalize_json_key(key) in label_keys and isinstance(value, (str, int))]
+        if any(label in wanted for label in labels):
+            for key, value in payload.items():
+                if normalize_json_key(key) in value_keys:
+                    count = parse_nonnegative_count(value)
+                    if count is not None:
+                        return count
+        for value in payload.values():
+            count = find_mesh_part_count(value)
+            if count is not None:
+                return count
+    elif isinstance(payload, list):
+        for value in payload:
+            count = find_mesh_part_count(value)
+            if count is not None:
+                return count
+    return None
+
+
+def safe_get_roblox_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    headers = {"Accept": "application/json", "User-Agent": "NamelessTools/1.0"}
+    if ROBLOX_OPEN_CLOUD_KEY:
+        headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+    response = requests.get(url, params=params or {}, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False)
     if response.status_code in (301, 302, 303, 307, 308):
         location = response.headers.get("Location", "")
-        if not location.startswith("https://apis.roblox.com/"):
-            raise RuntimeError("Roblox returned an unsafe redirect")
-        response = requests.get(
-            location,
-            headers={
-                "Accept": "application/json",
-                "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
-                "User-Agent": "NamelessTools/1.0",
-            },
-            timeout=(7, ROBLOX_HTTP_TIMEOUT),
-            allow_redirects=False,
-        )
-    if response.status_code in (401, 403):
-        raise RuntimeError("Open Cloud key was rejected for Creator Store asset details")
-    if response.status_code == 404:
-        raise RuntimeError("Creator Store asset details were not found")
+        parsed = urlparse(location)
+        if parsed.scheme != "https" or parsed.hostname != "apis.roblox.com":
+            raise RuntimeError("unsafe details redirect")
+        response = requests.get(location, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False)
     if response.status_code >= 400:
-        message = response.text[:400].strip()
-        raise RuntimeError(f"Roblox details HTTP {response.status_code}: {message or 'request failed'}")
+        message = response.text[:250].strip()
+        raise RuntimeError(f"HTTP {response.status_code}: {message or 'request failed'}")
     try:
         payload = response.json()
     except Exception as exc:
-        raise RuntimeError("Roblox returned invalid asset details JSON") from exc
+        raise RuntimeError("invalid JSON") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("Unexpected Roblox asset details response")
+        raise RuntimeError("unexpected JSON shape")
     return payload
+
+
+def fetch_creator_store_asset_details_v2(asset_id: int) -> Dict[str, Any]:
+    if not ROBLOX_OPEN_CLOUD_KEY:
+        raise RuntimeError("Open Cloud key is not configured")
+    return safe_get_roblox_json(f"https://apis.roblox.com/toolbox-service/v2/assets/{int(asset_id)}")
+
+
+def fetch_creator_store_item_details_v1(asset_id: int) -> Dict[str, Any]:
+    return safe_get_roblox_json(
+        "https://apis.roblox.com/toolbox-service/v1/items/details",
+        {"assetIds": str(int(asset_id))},
+    )
+
+
+def trusted_creator_store_page(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.hostname == "create.roblox.com"
+
+
+def fetch_creator_store_page(asset_id: int) -> str:
+    url = f"https://create.roblox.com/store/asset/{int(asset_id)}"
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    }
+    for _ in range(4):
+        response = requests.get(url, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False, stream=True)
+        try:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location", "")
+                if location.startswith("/"):
+                    location = "https://create.roblox.com" + location
+                if not trusted_creator_store_page(location):
+                    raise RuntimeError("unsafe Store redirect")
+                url = location
+                continue
+            if response.status_code >= 400:
+                message = response.text[:180].strip()
+                raise RuntimeError(f"HTTP {response.status_code}: {message or 'request failed'}")
+            chunks, total = [], 0
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > STORE_PAGE_MAX_BYTES:
+                    raise RuntimeError("Store page is too large")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            return raw.decode(response.encoding or "utf-8", errors="replace")
+        finally:
+            response.close()
+    raise RuntimeError("too many Store redirects")
+
+
+def find_mesh_part_count_in_store_html(page_html: str) -> Optional[int]:
+    if not page_html:
+        return None
+    decoded = html_lib.unescape(page_html).replace('\\"', '"').replace("\\'", "'")
+    patterns = (
+        r'["\'](?:meshPartCount|meshPartsCount|meshpartCount|mesh_part_count|meshPartInstanceCount)["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
+        r'["\']MeshPart\s*Count["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, decoded, flags=re.IGNORECASE):
+            count = parse_nonnegative_count(match.group(1))
+            if count is not None:
+                return count
+    visible = re.sub(r"<[^>]*>", " ", decoded)
+    visible = re.sub(r"\s+", " ", visible)
+    match = re.search(r"\bMeshPart\s*Count\b\s*[:\-]?\s*([0-9][0-9,\u00a0 ]{0,20})", visible, flags=re.IGNORECASE)
+    return parse_nonnegative_count(match.group(1)) if match else None
 
 
 def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
@@ -1864,32 +1939,55 @@ def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
         if cached:
             cached["cached"] = True
             return cached
+    attempts: List[str] = []
+    count: Optional[int] = None
+    source = ""
     try:
-        details = fetch_creator_store_asset_details(asset_id)
+        details = fetch_creator_store_asset_details_v2(asset_id)
         count = find_mesh_part_count(details)
-        if count is None:
-            result = {
-                "status": "unknown",
-                "mesh_part_count": None,
-                "reason": "Roblox asset details did not include MeshPart Count",
-                "source": "creator_store_asset_details",
-            }
+        if count is not None:
+            source = "creator_store_asset_details_v2"
         else:
-            result = {
-                "status": "has_mesh" if count > 0 else "no_mesh",
-                "mesh_part_count": count,
-                "reason": "",
-                "source": "creator_store_asset_details",
-            }
+            attempts.append("v2 details had no MeshPart Count")
     except Exception as exc:
+        attempts.append("v2 details " + str(exc))
+    if count is None:
+        try:
+            details = fetch_creator_store_item_details_v1(asset_id)
+            count = find_mesh_part_count(details)
+            if count is not None:
+                source = "creator_store_item_details_v1"
+            else:
+                attempts.append("v1 item details had no MeshPart Count")
+        except Exception as exc:
+            attempts.append("v1 item details " + str(exc))
+    if count is None:
+        try:
+            page_html = fetch_creator_store_page(asset_id)
+            count = find_mesh_part_count_in_store_html(page_html)
+            if count is not None:
+                source = "creator_store_page"
+            else:
+                attempts.append("Store page had no MeshPart Count")
+        except Exception as exc:
+            attempts.append("Store page " + str(exc))
+    if count is None:
         result = {
             "status": "unknown",
             "mesh_part_count": None,
-            "reason": str(exc),
-            "source": "creator_store_asset_details",
+            "reason": "; ".join(attempts)[:900] or "MeshPart Count was not returned",
+            "source": "creator_store_technical_details",
+        }
+    else:
+        result = {
+            "status": "has_mesh" if count > 0 else "no_mesh",
+            "mesh_part_count": int(count),
+            "reason": "",
+            "source": source,
         }
     result["cached"] = False
     return save_mesh_scan_cache(asset_id, result)
+
 
 def cleanup_model_downloads() -> None:
     cutoff = time.time() - MODEL_DOWNLOAD_TTL
@@ -2023,7 +2121,7 @@ def admin_model_mesh_status(asset_id: str):
         "status": str(result.get("status", "unknown")),
         "mesh_part_count": result.get("mesh_part_count"),
         "reason": str(result.get("reason", "")),
-        "source": str(result.get("source", "creator_store_asset_details")),
+        "source": str(result.get("source", "creator_store_technical_details")),
         "cached": bool(result.get("cached", False)),
         "checked_at": int(result.get("checked_at", int(time.time()))),
         "version": APP_VERSION,
@@ -2114,7 +2212,7 @@ def version():
         "image_only_filter": True,
         "mesh_detection": "Creator Store asset details MeshPart Count",
         "mesh_filter": "only models with confirmed MeshPart Count = 0",
-        "mesh_details_endpoint": "/toolbox-service/v2/assets/{id}",
+        "mesh_details_sources": ["/toolbox-service/v2/assets/{id}", "/toolbox-service/v1/items/details", "Creator Store page"],
         "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_notice": "rename the downloaded file and add .rbxm",
