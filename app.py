@@ -22,7 +22,7 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v19-store-page-meshpart-fix-2026-07-12"
+APP_VERSION = "model-search-v20-meshpart-store-text-fix-2026-07-12"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -38,7 +38,7 @@ MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", 
 MESH_SCAN_CACHE_DIR = os.environ.get("MESH_SCAN_CACHE_DIR", "mesh_scan_cache")
 MESH_SCAN_EXACT_TTL = max(3600, min(2592000, int(os.environ.get("MESH_SCAN_EXACT_TTL", "604800"))))
 MESH_SCAN_UNKNOWN_TTL = max(60, min(86400, int(os.environ.get("MESH_SCAN_UNKNOWN_TTL", "900"))))
-MESH_DETAILS_SOURCE = "creator_store_technical_details_v3"
+MESH_DETAILS_SOURCE = "creator_store_technical_details_v4"
 STORE_PAGE_MAX_BYTES = max(250000, min(8000000, int(os.environ.get("STORE_PAGE_MAX_BYTES", "4000000"))))
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
@@ -455,8 +455,16 @@ function setCardMeshStatus(assetId, status, meshPartCount, reason) {
 async function checkOneModelMesh(model, generation) {
     const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
     if (!assetId || generation !== state.meshScanGeneration) return;
+    const includedCount = Number(model && model.mesh_part_count);
+    if (model && model.mesh_part_count !== null && model.mesh_part_count !== undefined && Number.isFinite(includedCount) && includedCount >= 0) {
+        const fixedCount = Math.floor(includedCount);
+        setCardMeshStatus(assetId, fixedCount > 0 ? 'has_mesh' : 'no_mesh', fixedCount, 'Returned by Creator Store search.');
+        return;
+    }
     try {
-        const res = await fetch('/admin/models/mesh-status/' + encodeURIComponent(assetId) + '?_=' + Date.now(), {
+        const modelName = safeText(model && model.name ? model.name : '');
+        const query = '?name=' + encodeURIComponent(modelName) + '&_=' + Date.now();
+        const res = await fetch('/admin/models/mesh-status/' + encodeURIComponent(assetId) + query, {
             cache: 'no-store',
             headers: adminHeaders({ 'Accept': 'application/json' })
         });
@@ -1426,6 +1434,9 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dic
         creator_value = asset.get("creator", item.get("creator"))
         creator = normalize_creator(creator_value)
         description = str(first_nonempty(asset, ("description", "summary"), ""))[:500]
+        search_mesh_count = find_mesh_part_count(item)
+        if search_mesh_count is None and asset is not item:
+            search_mesh_count = find_mesh_part_count(asset)
         models.append({
             "id": asset_id,
             "name": name,
@@ -1433,6 +1444,7 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dic
             "description": description,
             "thumbnail": "",
             "asset_type": "Model",
+            "mesh_part_count": search_mesh_count,
         })
         seen.add(asset_id)
         if len(models) >= limit:
@@ -1877,63 +1889,149 @@ def trusted_creator_store_page(url: str) -> bool:
     return parsed.scheme == "https" and parsed.hostname == "create.roblox.com"
 
 
-def fetch_creator_store_page(asset_id: int) -> str:
-    url = f"https://create.roblox.com/store/asset/{int(asset_id)}"
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    }
-    for _ in range(4):
-        response = requests.get(url, headers=headers, timeout=(7, ROBLOX_HTTP_TIMEOUT), allow_redirects=False, stream=True)
-        try:
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("Location", "")
-                if location.startswith("/"):
-                    location = "https://create.roblox.com" + location
-                if not trusted_creator_store_page(location):
-                    raise RuntimeError("unsafe Store redirect")
-                url = location
-                continue
-            if response.status_code >= 400:
-                message = response.text[:180].strip()
-                raise RuntimeError(f"HTTP {response.status_code}: {message or 'request failed'}")
-            chunks, total = [], 0
-            for chunk in response.iter_content(chunk_size=65536):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > STORE_PAGE_MAX_BYTES:
-                    raise RuntimeError("Store page is too large")
-                chunks.append(chunk)
-            raw = b"".join(chunks)
-            return raw.decode(response.encoding or "utf-8", errors="replace")
-        finally:
-            response.close()
-    raise RuntimeError("too many Store redirects")
+def creator_store_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "")).strip("-")
+    return slug[:100] or "Model"
+
+
+def read_limited_text_response(response, max_bytes: int = STORE_PAGE_MAX_BYTES) -> str:
+    chunks: List[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError("response is too large")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    return raw.decode(response.encoding or "utf-8", errors="replace")
+
+
+def fetch_creator_store_direct_page(asset_id: int, asset_name: str = "") -> str:
+    slug = creator_store_slug(asset_name)
+    urls = [
+        f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}",
+        f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}/reviews",
+        f"https://create.roblox.com/store/asset/{int(asset_id)}",
+    ]
+    user_agents = [
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    ]
+    errors: List[str] = []
+    for initial_url in urls:
+        for user_agent in user_agents:
+            url = initial_url
+            try:
+                for _ in range(4):
+                    response = requests.get(
+                        url,
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Cache-Control": "no-cache",
+                            "User-Agent": user_agent,
+                        },
+                        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                    try:
+                        if response.status_code in (301, 302, 303, 307, 308):
+                            location = response.headers.get("Location", "")
+                            if location.startswith("/"):
+                                location = "https://create.roblox.com" + location
+                            if not trusted_creator_store_page(location):
+                                raise RuntimeError("unsafe Store redirect")
+                            url = location
+                            continue
+                        if response.status_code >= 400:
+                            raise RuntimeError(f"HTTP {response.status_code}")
+                        return read_limited_text_response(response)
+                    finally:
+                        response.close()
+            except Exception as exc:
+                errors.append(str(exc))
+    raise RuntimeError("direct Store page failed: " + "; ".join(errors[-3:]))
+
+
+def fetch_creator_store_reader_text(asset_id: int, asset_name: str = "") -> str:
+    # Public text-rendering fallback. Only the public Creator Store URL is sent.
+    slug = creator_store_slug(asset_name)
+    target = f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}"
+    reader_url = "https://r.jina.ai/https://create.roblox.com/store/asset/" + str(int(asset_id)) + "/" + slug
+    response = requests.get(
+        reader_url,
+        headers={
+            "Accept": "text/plain,text/markdown,*/*;q=0.8",
+            "User-Agent": "NamelessTools/1.0",
+            "X-Target-URL": target,
+        },
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+        stream=True,
+    )
+    try:
+        if response.status_code >= 400:
+            raise RuntimeError(f"reader HTTP {response.status_code}")
+        return read_limited_text_response(response)
+    finally:
+        response.close()
+
+
+def decode_store_embedded_text(page_text: str) -> str:
+    decoded = str(page_text or "")
+    for _ in range(3):
+        before = decoded
+        decoded = html_lib.unescape(decoded)
+        decoded = re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda m: chr(int(m.group(1), 16)),
+            decoded,
+        )
+        decoded = re.sub(
+            r"\\x([0-9a-fA-F]{2})",
+            lambda m: chr(int(m.group(1), 16)),
+            decoded,
+        )
+        decoded = decoded.replace('\\"', '"').replace("\\'", "'")
+        decoded = decoded.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+        if decoded == before:
+            break
+    return decoded
 
 
 def find_mesh_part_count_in_store_html(page_html: str) -> Optional[int]:
     if not page_html:
         return None
-    decoded = html_lib.unescape(page_html).replace('\\"', '"').replace("\\'", "'")
-    patterns = (
+    decoded = decode_store_embedded_text(page_html)
+    key_patterns = (
         r'["\'](?:meshPartCount|meshPartsCount|meshpartCount|mesh_part_count|meshPartInstanceCount)["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
         r'["\']MeshPart\s*Count["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
     )
-    for pattern in patterns:
+    for pattern in key_patterns:
         for match in re.finditer(pattern, decoded, flags=re.IGNORECASE):
             count = parse_nonnegative_count(match.group(1))
             if count is not None:
                 return count
-    visible = re.sub(r"<[^>]*>", " ", decoded)
+
+    # Works for both rendered HTML and markdown/text returned by a reader.
+    visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", decoded, flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(r"<[^>]*>", " ", visible)
+    visible = re.sub(r"[`*_#|\[\]()]", " ", visible)
     visible = re.sub(r"\s+", " ", visible)
-    match = re.search(r"\bMeshPart\s*Count\b\s*[:\-]?\s*([0-9][0-9,\u00a0 ]{0,20})", visible, flags=re.IGNORECASE)
+    match = re.search(
+        r"\bMeshPart\s*Count\b[^0-9]{0,80}([0-9][0-9,\u00a0 ]{0,20})",
+        visible,
+        flags=re.IGNORECASE,
+    )
     return parse_nonnegative_count(match.group(1)) if match else None
 
 
-def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
+def get_model_mesh_status(asset_id: int, asset_name: str = "", force: bool = False) -> Dict[str, Any]:
     if not force:
         cached = load_mesh_scan_cache(asset_id)
         if cached:
@@ -1963,14 +2061,24 @@ def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
             attempts.append("v1 item details " + str(exc))
     if count is None:
         try:
-            page_html = fetch_creator_store_page(asset_id)
+            page_html = fetch_creator_store_direct_page(asset_id, asset_name)
             count = find_mesh_part_count_in_store_html(page_html)
             if count is not None:
-                source = "creator_store_page"
+                source = "creator_store_page_direct"
             else:
-                attempts.append("Store page had no MeshPart Count")
+                attempts.append("direct Store page had no MeshPart Count")
         except Exception as exc:
-            attempts.append("Store page " + str(exc))
+            attempts.append("direct Store page " + str(exc))
+    if count is None:
+        try:
+            reader_text = fetch_creator_store_reader_text(asset_id, asset_name)
+            count = find_mesh_part_count_in_store_html(reader_text)
+            if count is not None:
+                source = "creator_store_page_reader"
+            else:
+                attempts.append("rendered Store text had no MeshPart Count")
+        except Exception as exc:
+            attempts.append("rendered Store text " + str(exc))
     if count is None:
         result = {
             "status": "unknown",
@@ -2114,7 +2222,8 @@ def admin_model_mesh_status(asset_id: str):
     if not asset_id.isdigit() or int(asset_id) <= 0:
         return json_error("Bad asset ID", 400)
     force = request.args.get("force", "").strip().lower() in ("1", "true", "yes")
-    result = get_model_mesh_status(int(asset_id), force=force)
+    asset_name = request.args.get("name", "").strip()[:160]
+    result = get_model_mesh_status(int(asset_id), asset_name=asset_name, force=force)
     response = jsonify({
         "ok": True,
         "asset_id": int(asset_id),
@@ -2210,9 +2319,9 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
-        "mesh_detection": "Creator Store asset details MeshPart Count",
+        "mesh_detection": "search payload -> Store details -> rendered Store text",
         "mesh_filter": "only models with confirmed MeshPart Count = 0",
-        "mesh_details_sources": ["/toolbox-service/v2/assets/{id}", "/toolbox-service/v1/items/details", "Creator Store page"],
+        "mesh_details_sources": ["search payload", "/toolbox-service/v2/assets/{id}", "/toolbox-service/v1/items/details", "Creator Store page", "rendered public Store text"],
         "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_notice": "rename the downloaded file and add .rbxm",
