@@ -1,11 +1,15 @@
+import hmac
 import json
 import os
+import re
 import time
 import traceback
+from urllib.parse import urlparse
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, render_template_string, request
+import requests
+from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -14,6 +18,10 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
+ROBLOX_OPEN_CLOUD_KEY = os.environ.get("ROBLOX_OPEN_CLOUD_KEY", "").strip()
+ROBLOX_HTTP_TIMEOUT = max(5, min(60, int(os.environ.get("ROBLOX_HTTP_TIMEOUT", "25"))))
+ROBLOX_MAX_MODEL_BYTES = max(1_000_000, min(100_000_000, int(os.environ.get("ROBLOX_MAX_MODEL_BYTES", "50000000"))))
 DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
 VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
@@ -69,13 +77,47 @@ HTML = r'''
         .topline { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }
         @media (max-width: 720px) { .topline { grid-template-columns: 1fr; } }
         .mini { margin-top: 8px; font-size: 12px; color: #a9a9b8; }
+        .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 18px; padding: 5px; border-radius: 12px; background: #0e0e14; border: 1px solid #2b2c36; }
+        .tab-btn { background: transparent; color: #a8a8b5; border: 1px solid transparent; }
+        .tab-btn.active { background: #262833; color: #fff; border-color: #353744; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+        .model-actions { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+        .model-actions button { width: auto; min-width: 120px; }
+        .model-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+        .model-card { min-width: 0; overflow: hidden; border-radius: 14px; border: 1px solid #2d2e39; background: #111117; }
+        .model-thumb { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: cover; background: #09090d; }
+        .model-body { padding: 12px; }
+        .model-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .model-meta { min-height: 34px; margin: 6px 0 10px; color: #9797a6; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+        .model-card button { padding: 10px; }
+        .empty-models { grid-column: 1 / -1; padding: 28px 14px; text-align: center; color: #9797a6; border: 1px dashed #333441; border-radius: 14px; }
+        .admin-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+        .admin-row button { width: auto; padding: 9px 12px; }
+        .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 18px; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
+        .modal-backdrop.open { display: flex; }
+        .modal-card { width: min(410px, 100%); padding: 18px; border-radius: 16px; border: 1px solid #333441; background: #17171d; box-shadow: 0 24px 80px rgba(0,0,0,.55); }
+        .modal-card h2 { margin-bottom: 6px; }
+        .modal-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+        .download-note { margin-top: 12px; font-size: 12px; line-height: 1.45; color: #9292a1; }
+        @media (max-width: 720px) {
+            .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .model-actions { grid-template-columns: 1fr; }
+            .model-actions button { width: 100%; }
+        }
+        @media (max-width: 430px) { .model-grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
 <div class="wrap">
     <div class="box">
-        <h1>Image / Video Painter</h1>
+        <h1>Nameless Tools</h1>
+        <div class="tabs">
+            <button id="painterTabBtn" class="tab-btn active" type="button">Image / Video</button>
+            <button id="modelsTabBtn" class="tab-btn" type="button">Model Browser</button>
+        </div>
 
+        <div id="painterPanel" class="tab-panel active">
         <div class="topline">
             <div>
                 <label for="sharedPort">Port</label>
@@ -154,6 +196,43 @@ HTML = r'''
             <div id="videoStatus" class="status">Choose a video. Changing video settings automatically rebuilds the current selected video.</div>
             <div class="mini" id="pageStatus"></div>
         </div>
+        </div>
+
+        <div id="modelsPanel" class="tab-panel">
+            <div class="admin-row">
+                <div>
+                    <h2>Roblox Model Browser</h2>
+                    <div class="hint">Search public Creator Store models and download the model file returned by Roblox.</div>
+                </div>
+                <button id="adminLogoutBtn" type="button" class="secondary">Lock</button>
+            </div>
+            <div class="section">
+                <div class="model-actions">
+                    <div>
+                        <label for="modelQuery">Model name</label>
+                        <input id="modelQuery" autocomplete="off" placeholder="castle, car, house...">
+                    </div>
+                    <button id="modelSearchBtn" type="button">Search</button>
+                </div>
+                <div id="modelStatus" class="status">Enter a model name.</div>
+                <div id="modelResults" class="model-grid"></div>
+                <div class="download-note">Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. XML models are returned as .rbxmx; binary models are returned as .rbxm.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="adminModal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card">
+        <h2>Admin access</h2>
+        <div class="hint">Enter the admin key to open Model Browser.</div>
+        <label for="adminKeyInput">Admin key</label>
+        <input id="adminKeyInput" type="password" autocomplete="current-password" placeholder="Admin key">
+        <div id="adminLoginStatus" class="status"></div>
+        <div class="modal-buttons">
+            <button id="adminCancelBtn" type="button" class="secondary">Cancel</button>
+            <button id="adminLoginBtn" type="button">Open</button>
+        </div>
     </div>
 </div>
 
@@ -165,11 +244,189 @@ const $ = id => document.getElementById(id);
 const state = {
     imageUploaded: false,
     videoConverted: false,
+    adminKey: '',
+    modelBusy: false,
     imageSettingsTimer: null,
     videoSettingsTimer: null,
     busyImage: false,
     busyVideo: false,
 };
+
+
+function switchPanel(name) {
+    const painter = name === 'painter';
+    $('painterPanel').classList.toggle('active', painter);
+    $('modelsPanel').classList.toggle('active', !painter);
+    $('painterTabBtn').classList.toggle('active', painter);
+    $('modelsTabBtn').classList.toggle('active', !painter);
+    if (painter) state.adminKey = '';
+}
+function showAdminModal() {
+    $('adminLoginStatus').textContent = '';
+    $('adminKeyInput').value = '';
+    $('adminModal').classList.add('open');
+    $('adminModal').setAttribute('aria-hidden', 'false');
+    setTimeout(() => $('adminKeyInput').focus(), 30);
+}
+function hideAdminModal() {
+    $('adminModal').classList.remove('open');
+    $('adminModal').setAttribute('aria-hidden', 'true');
+}
+function adminHeaders(extra) {
+    return Object.assign({ 'X-Admin-Key': state.adminKey }, extra || {});
+}
+async function openModelBrowser() {
+    const key = String($('adminKeyInput').value || '');
+    if (!key) {
+        $('adminLoginStatus').textContent = 'Enter the admin key.';
+        return;
+    }
+    $('adminLoginBtn').disabled = true;
+    $('adminLoginStatus').textContent = 'Checking key...';
+    try {
+        const res = await fetch('/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key })
+        });
+        const data = await parseJson(res);
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Bad admin key');
+        state.adminKey = key;
+        hideAdminModal();
+        switchPanel('models');
+        $('modelQuery').focus();
+    } catch (e) {
+        state.adminKey = '';
+        $('adminLoginStatus').textContent = e && e.message ? e.message : String(e);
+    } finally {
+        $('adminLoginBtn').disabled = false;
+    }
+}
+function safeText(value) {
+    return String(value == null ? '' : value);
+}
+function cardElement(model) {
+    const card = document.createElement('div');
+    card.className = 'model-card';
+
+    const img = document.createElement('img');
+    img.className = 'model-thumb';
+    img.loading = 'lazy';
+    img.alt = safeText(model.name || 'Roblox model');
+    if (model.thumbnail) img.src = model.thumbnail;
+
+    const body = document.createElement('div');
+    body.className = 'model-body';
+    const title = document.createElement('div');
+    title.className = 'model-name';
+    title.title = safeText(model.name || 'Untitled model');
+    title.textContent = safeText(model.name || 'Untitled model');
+
+    const meta = document.createElement('div');
+    meta.className = 'model-meta';
+    meta.textContent = 'by ' + safeText(model.creator || 'Unknown') + ' · ID ' + safeText(model.id);
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Download RBXM';
+    button.onclick = () => downloadModel(model, button);
+
+    body.append(title, meta, button);
+    card.append(img, body);
+    return card;
+}
+async function searchModels() {
+    if (state.modelBusy) return;
+    const query = String($('modelQuery').value || '').trim();
+    if (query.length < 2) {
+        $('modelStatus').textContent = 'Enter at least 2 characters.';
+        return;
+    }
+    state.modelBusy = true;
+    $('modelSearchBtn').disabled = true;
+    $('modelStatus').textContent = 'Searching Roblox Creator Store...';
+    $('modelResults').replaceChildren();
+    try {
+        const res = await fetch('/admin/models/search?q=' + encodeURIComponent(query) + '&limit=24', {
+            headers: adminHeaders({ 'Accept': 'application/json' })
+        });
+        const data = await parseJson(res);
+        if (res.status === 401 || res.status === 403) {
+            state.adminKey = '';
+            switchPanel('painter');
+            showAdminModal();
+            throw new Error(data.error || 'Admin access expired');
+        }
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Search failed');
+        const models = Array.isArray(data.models) ? data.models : [];
+        $('modelStatus').textContent = models.length ? ('Found ' + models.length + ' models.') : 'No models found.';
+        if (!models.length) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-models';
+            empty.textContent = 'No matching public models.';
+            $('modelResults').appendChild(empty);
+        } else {
+            models.forEach(model => $('modelResults').appendChild(cardElement(model)));
+        }
+    } catch (e) {
+        $('modelStatus').textContent = 'Search error: ' + (e && e.message ? e.message : e);
+    } finally {
+        state.modelBusy = false;
+        $('modelSearchBtn').disabled = false;
+    }
+}
+function responseFilename(res, fallback) {
+    const value = res.headers.get('Content-Disposition') || '';
+    const utf = value.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf) {
+        try { return decodeURIComponent(utf[1]); } catch (e) {}
+    }
+    const normal = value.match(/filename="?([^";]+)"?/i);
+    return normal ? normal[1] : fallback;
+}
+async function downloadModel(model, button) {
+    const oldText = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Downloading...';
+    try {
+        const res = await fetch('/admin/models/download/' + encodeURIComponent(model.id), {
+            headers: adminHeaders()
+        });
+        if (!res.ok) {
+            let message = 'Download failed';
+            try {
+                const data = await parseJson(res);
+                message = data.error || message;
+            } catch (e) {}
+            throw new Error(message);
+        }
+        const blob = await res.blob();
+        const filename = responseFilename(res, 'model_' + model.id + '.rbxm');
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+        $('modelStatus').textContent = 'Downloaded: ' + filename;
+    } catch (e) {
+        $('modelStatus').textContent = 'Download error: ' + (e && e.message ? e.message : e);
+    } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+    }
+}
+$('painterTabBtn').onclick = () => switchPanel('painter');
+$('modelsTabBtn').onclick = showAdminModal;
+$('adminCancelBtn').onclick = hideAdminModal;
+$('adminLoginBtn').onclick = openModelBrowser;
+$('adminLogoutBtn').onclick = () => switchPanel('painter');
+$('modelSearchBtn').onclick = searchModels;
+$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels(); });
+$('adminKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') openModelBrowser(); });
+$('adminModal').addEventListener('click', e => { if (e.target === $('adminModal')) hideAdminModal(); });
 
 function cleanPort(v) {
     const p = String(v || '').replace(/\D+/g, '').slice(0, 8);
@@ -773,6 +1030,400 @@ def find_frame(port: str, index: int, meta: Dict[str, Any]) -> Optional[Dict[str
         if int(frame.get("index", -1)) == index:
             return normalize_frame(frame, meta)
     return None
+
+
+
+# ---------- Roblox model browser ----------
+def admin_key_from_request() -> str:
+    key = request.headers.get("X-Admin-Key", "")
+    if key:
+        return key
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        return str(body.get("key", ""))
+    return str(request.values.get("key", ""))
+
+
+def admin_authorized() -> bool:
+    supplied = admin_key_from_request()
+    return bool(supplied) and hmac.compare_digest(supplied, ADMIN_KEY)
+
+
+def require_admin_response():
+    if admin_authorized():
+        return None
+    return json_error("Bad admin key", 403)
+
+
+def roblox_headers() -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "NamelessTools/1.0",
+    }
+    if ROBLOX_OPEN_CLOUD_KEY:
+        headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+    return headers
+
+
+def roblox_json_request(method: str, url: str, **kwargs) -> Dict[str, Any]:
+    headers = dict(roblox_headers())
+    headers.update(kwargs.pop("headers", {}) or {})
+    response = requests.request(
+        method,
+        url,
+        headers=headers,
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        **kwargs,
+    )
+    if response.status_code >= 400:
+        message = response.text[:300].strip()
+        raise RuntimeError(f"Roblox returned HTTP {response.status_code}: {message or 'request failed'}")
+    try:
+        data = response.json()
+    except Exception as e:
+        raise RuntimeError("Roblox returned invalid JSON") from e
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected Roblox response")
+    return data
+
+
+def first_nonempty(mapping: Dict[str, Any], names: Tuple[str, ...], default: Any = None) -> Any:
+    for name in names:
+        value = mapping.get(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def find_asset_list(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        dicts = [item for item in payload if isinstance(item, dict)]
+        if dicts and any(
+            first_nonempty(item, ("id", "assetId", "assetID")) is not None or isinstance(item.get("asset"), dict)
+            for item in dicts
+        ):
+            return dicts
+        for item in payload:
+            found = find_asset_list(item)
+            if found:
+                return found
+    elif isinstance(payload, dict):
+        for key in ("data", "assets", "items", "results", "creatorStoreAssets", "searchResults"):
+            if key in payload:
+                found = find_asset_list(payload[key])
+                if found:
+                    return found
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                found = find_asset_list(value)
+                if found:
+                    return found
+    return []
+
+
+def normalize_creator(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(first_nonempty(value, ("name", "displayName", "username"), "Unknown"))
+    if value is None:
+        return "Unknown"
+    return str(value)
+
+
+def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    items = find_asset_list(payload)
+    models: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        asset = item.get("asset") if isinstance(item.get("asset"), dict) else item
+        asset_id = first_nonempty(asset, ("id", "assetId", "assetID", "asset_id"))
+        if asset_id is None:
+            asset_id = first_nonempty(item, ("id", "assetId", "assetID", "asset_id"))
+        try:
+            asset_id = int(asset_id)
+        except Exception:
+            continue
+        if asset_id <= 0 or asset_id in seen:
+            continue
+        type_id = first_nonempty(asset, ("typeId", "assetTypeId", "assetType"))
+        if isinstance(type_id, int) and type_id not in (8, 10):
+            continue
+        type_text = str(type_id or "").upper()
+        if type_text and "MODEL" not in type_text and type_text not in ("8", "10"):
+            continue
+        name = str(first_nonempty(asset, ("name", "displayName", "title"), f"Model {asset_id}"))
+        creator_value = asset.get("creator", item.get("creator"))
+        creator = normalize_creator(creator_value)
+        description = str(first_nonempty(asset, ("description", "summary"), ""))[:500]
+        models.append({
+            "id": asset_id,
+            "name": name,
+            "creator": creator,
+            "description": description,
+            "thumbnail": "",
+        })
+        seen.add(asset_id)
+        if len(models) >= limit:
+            break
+    return models
+
+
+def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
+    if not asset_ids:
+        return {}
+    response = requests.get(
+        "https://thumbnails.roblox.com/v1/assets",
+        params={
+            "assetIds": ",".join(str(v) for v in asset_ids[:100]),
+            "size": "420x420",
+            "format": "Png",
+            "isCircular": "false",
+        },
+        headers={"Accept": "application/json", "User-Agent": "NamelessTools/1.0"},
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+    )
+    if response.status_code >= 400:
+        return {}
+    try:
+        data = response.json().get("data", [])
+    except Exception:
+        return {}
+    result: Dict[int, str] = {}
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            target_id = int(item.get("targetId"))
+        except Exception:
+            continue
+        image_url = item.get("imageUrl")
+        if isinstance(image_url, str) and image_url.startswith("https://"):
+            result[target_id] = image_url
+    return result
+
+
+def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
+    # The documented v2 search endpoint is attempted first. Roblox has changed
+    # protobuf JSON field names over time, so a legacy read-only search fallback
+    # remains for compatibility.
+    errors = []
+    v2_payloads = [
+        {"query": query, "assetTypes": ["ASSET_TYPE_MODEL"], "maxPageSize": limit},
+        {"query": query, "assetTypes": ["MODEL"], "limit": limit},
+        {"keyword": query, "assetTypes": [10], "limit": limit},
+    ]
+    for body in v2_payloads:
+        try:
+            payload = roblox_json_request(
+                "POST",
+                "https://apis.roblox.com/toolbox-service/v2/assets:search",
+                json=body,
+            )
+            models = normalize_model_items(payload, limit)
+            if models:
+                break
+        except Exception as e:
+            errors.append(str(e))
+            models = []
+    else:
+        models = []
+
+    if not models:
+        try:
+            payload = roblox_json_request(
+                "GET",
+                "https://apis.roblox.com/toolbox-service/v1/marketplace/8",
+                params={
+                    "keyword": query,
+                    "limit": limit,
+                    "pageNumber": 1,
+                    "includeOnlyVerifiedCreators": "false",
+                },
+            )
+            models = normalize_model_items(payload, limit)
+        except Exception as e:
+            errors.append(str(e))
+
+    if not models and errors:
+        raise RuntimeError(errors[-1])
+
+    thumbs = fetch_model_thumbnails([item["id"] for item in models])
+    for item in models:
+        item["thumbnail"] = thumbs.get(item["id"], "")
+    return models
+
+
+def read_limited_response(response: requests.Response) -> bytes:
+    declared = response.headers.get("Content-Length")
+    if declared:
+        try:
+            if int(declared) > ROBLOX_MAX_MODEL_BYTES:
+                raise RuntimeError("Model is too large")
+        except ValueError:
+            pass
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > ROBLOX_MAX_MODEL_BYTES:
+            raise RuntimeError("Model is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def trusted_roblox_location(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (
+        host == "roblox.com"
+        or host.endswith(".roblox.com")
+        or host == "rbxcdn.com"
+        or host.endswith(".rbxcdn.com")
+        or host.endswith(".robloxusercontent.com")
+    )
+
+
+def find_download_location(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("location", "url", "downloadUrl", "downloadURL"):
+            value = payload.get(key)
+            if isinstance(value, str) and trusted_roblox_location(value):
+                return value
+        for value in payload.values():
+            found = find_download_location(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = find_download_location(value)
+            if found:
+                return found
+    return None
+
+
+def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
+    head = raw[:256].lstrip()
+    lower = head.lower()
+    if head.startswith(b"<roblox!"):
+        return ".rbxm", "application/octet-stream"
+    if lower.startswith(b"<?xml") or lower.startswith(b"<roblox"):
+        return ".rbxmx", "application/xml"
+    if lower.startswith(b"{") or lower.startswith(b"["):
+        raise RuntimeError("Roblox returned JSON instead of a model file")
+    if b"<html" in lower or lower.startswith(b"<!doctype"):
+        raise RuntimeError("Roblox returned an HTML error page")
+    raise RuntimeError("The downloaded asset is not a recognized RBXM/RBXMX model")
+
+
+def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
+    candidates = []
+    if ROBLOX_OPEN_CLOUD_KEY:
+        candidates.append((
+            f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
+            roblox_headers(),
+        ))
+    candidates.extend([
+        (f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
+        (f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
+    ])
+    errors = []
+    for url, headers in candidates:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=(7, ROBLOX_HTTP_TIMEOUT),
+                allow_redirects=True,
+                stream=True,
+            )
+            if response.status_code >= 400:
+                errors.append(f"HTTP {response.status_code}")
+                response.close()
+                continue
+            content_type = response.headers.get("Content-Type", "").lower()
+            raw = read_limited_response(response)
+            response.close()
+            if "json" in content_type or raw[:1] in (b"{", b"["):
+                try:
+                    payload = json.loads(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    payload = None
+                location = find_download_location(payload)
+                if location:
+                    follow = requests.get(
+                        location,
+                        headers={"User-Agent": "NamelessTools/1.0"},
+                        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+                        allow_redirects=True,
+                        stream=True,
+                    )
+                    if follow.status_code >= 400:
+                        errors.append(f"CDN HTTP {follow.status_code}")
+                        follow.close()
+                        continue
+                    raw = read_limited_response(follow)
+                    follow.close()
+            extension, mime = classify_model_bytes(raw)
+            return raw, extension, mime
+        except Exception as e:
+            errors.append(str(e))
+    message = errors[-1] if errors else "Roblox did not return the model"
+    raise RuntimeError(message)
+
+
+def safe_download_name(asset_id: int, extension: str) -> str:
+    return f"roblox_model_{asset_id}{extension}"
+
+
+@app.route("/admin/login", methods=["POST"])
+def admin_login():
+    if not admin_authorized():
+        time.sleep(0.15)
+        return json_error("Bad admin key", 403)
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/models/search", methods=["GET"])
+def admin_models_search():
+    denied = require_admin_response()
+    if denied:
+        return denied
+    query = re.sub(r"\s+", " ", request.args.get("q", "")).strip()[:80]
+    if len(query) < 2:
+        return json_error("Enter at least 2 characters", 400)
+    limit = read_int_arg(request.args, "limit", 24, 1, 30)
+    try:
+        models = search_creator_store_models(query, limit)
+    except Exception as e:
+        return json_error("Roblox search failed: " + str(e), 502)
+    return jsonify({"ok": True, "query": query, "models": models, "count": len(models)})
+
+
+@app.route("/admin/models/download/<asset_id>", methods=["GET"])
+def admin_models_download(asset_id: str):
+    denied = require_admin_response()
+    if denied:
+        return denied
+    if not asset_id.isdigit():
+        return json_error("Bad asset ID", 400)
+    numeric_id = int(asset_id)
+    if numeric_id <= 0:
+        return json_error("Bad asset ID", 400)
+    try:
+        raw, extension, mime = fetch_model_file(numeric_id)
+    except Exception as e:
+        return json_error("Roblox download failed: " + str(e), 502)
+    filename = safe_download_name(numeric_id, extension)
+    response = Response(raw, status=200, mimetype=mime)
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Content-Length"] = str(len(raw))
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 # ---------- routes ----------
