@@ -20,7 +20,7 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v11-download-fix-2026-07-11"
+APP_VERSION = "model-search-v12-legacy-asset-download-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -1510,11 +1510,6 @@ def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> 
                 follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
             return fetch_from_asset_endpoint(location, follow_headers, label + " redirect")
 
-        if response.status_code in (401, 403) and "apis.roblox.com" in url:
-            raise PermissionError(
-                "The Open Cloud key can search but cannot download assets. "
-                "Add Asset Delivery access (legacy-asset:manage) to ROBLOX_OPEN_CLOUD_KEY, then redeploy."
-            )
         if response.status_code >= 400:
             detail = response_error_text(response)
             raise RuntimeError(f"{label} returned HTTP {response.status_code}: {detail or 'request failed'}")
@@ -1545,38 +1540,19 @@ def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> 
 
 
 def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
-    errors: List[str] = []
-    if ROBLOX_OPEN_CLOUD_KEY:
-        try:
-            return fetch_from_asset_endpoint(
-                f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
-                {
-                    "Accept": "application/octet-stream, application/xml, application/json",
-                    "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
-                    "User-Agent": "NamelessTools/1.0",
-                },
-                "Open Cloud Asset Delivery",
-            )
-        except PermissionError:
-            raise
-        except Exception as exc:
-            errors.append(str(exc))
-
-    for url in (
-        f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
-        f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
-    ):
-        try:
-            return fetch_from_asset_endpoint(
-                url,
-                {"Accept": "application/octet-stream, application/xml, application/json", "User-Agent": "NamelessTools/1.0"},
-                "Roblox Asset Delivery",
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    message = errors[-1] if errors else "Roblox did not return the model"
-    raise RuntimeError(message)
+    legacy_url = f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}"
+    return fetch_from_asset_endpoint(
+        legacy_url,
+        {
+            "Accept": "*/*",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+        },
+        "Roblox legacy Asset Delivery",
+    )
 
 
 def cleanup_model_downloads() -> None:
@@ -1710,8 +1686,6 @@ def admin_models_prepare_download(asset_id: str):
     requested_name = body.get("name", "") if isinstance(body, dict) else ""
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
-    except PermissionError as e:
-        return json_error(str(e), 403, {"asset_delivery_permission_required": True})
     except Exception as e:
         return json_error("Roblox download failed: " + str(e), 502)
     base_name = clean_model_name(requested_name, numeric_id)
@@ -1757,8 +1731,6 @@ def admin_models_download(asset_id: str):
         return json_error("Bad asset ID", 400)
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
-    except PermissionError as e:
-        return json_error(str(e), 403, {"asset_delivery_permission_required": True})
     except Exception as e:
         return json_error("Roblox download failed: " + str(e), 502)
     filename = safe_download_name(numeric_id, extension)
@@ -1780,9 +1752,10 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
-        "download_flow": "prepare token -> direct browser attachment",
+        "download_flow": "legacy v1 asset -> local attachment",
+        "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
+        "download_uses_open_cloud_key": False,
         "asset_id_priority": "assetId before id",
-        "asset_delivery_permission": "legacy-asset:manage",
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
