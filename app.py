@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v4-2026-07-11"
+APP_VERSION = "model-search-v7-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -296,6 +296,11 @@ async function openModelBrowser() {
         state.adminKey = key;
         hideAdminModal();
         switchPanel('models');
+        if (!data.roblox_key_configured) {
+            $('modelStatus').textContent = 'Server setup required: add ROBLOX_OPEN_CLOUD_KEY in Render Environment.';
+        } else {
+            $('modelStatus').textContent = 'Enter a model name.';
+        }
         $('modelQuery').focus();
     } catch (e) {
         state.adminKey = '';
@@ -1057,7 +1062,12 @@ def require_admin_response():
     return json_error("Bad admin key", 403)
 
 
-def roblox_headers() -> Dict[str, str]:
+def roblox_headers(require_open_cloud: bool = False) -> Dict[str, str]:
+    if require_open_cloud and not ROBLOX_OPEN_CLOUD_KEY:
+        raise RuntimeError(
+            "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY. "
+            "Add a Roblox Open Cloud API key in Render Environment and redeploy."
+        )
     headers = {
         "Accept": "application/json",
         "User-Agent": "NamelessTools/1.0",
@@ -1067,8 +1077,8 @@ def roblox_headers() -> Dict[str, str]:
     return headers
 
 
-def roblox_json_request(method: str, url: str, **kwargs) -> Dict[str, Any]:
-    headers = dict(roblox_headers())
+def roblox_json_request(method: str, url: str, require_open_cloud: bool = False, **kwargs) -> Dict[str, Any]:
+    headers = dict(roblox_headers(require_open_cloud=require_open_cloud))
     headers.update(kwargs.pop("headers", {}) or {})
     response = requests.request(
         method,
@@ -1079,6 +1089,11 @@ def roblox_json_request(method: str, url: str, **kwargs) -> Dict[str, Any]:
     )
     if response.status_code >= 400:
         message = response.text[:300].strip()
+        if response.status_code in (401, 403) and require_open_cloud:
+            raise RuntimeError(
+                "Open Cloud key was rejected. Check that ROBLOX_OPEN_CLOUD_KEY is valid, active, "
+                "and has permission to search Creator Store assets."
+            )
         raise RuntimeError(f"Roblox returned HTTP {response.status_code}: {message or 'request failed'}")
     try:
         data = response.json()
@@ -1204,42 +1219,29 @@ def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
 
 
 def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
-    errors: List[str] = []
-    models: List[Dict[str, Any]] = []
+    if not ROBLOX_OPEN_CLOUD_KEY:
+        raise RuntimeError(
+            "Creator Store search is not configured. Set ROBLOX_OPEN_CLOUD_KEY in Render Environment."
+        )
+
     endpoint = "https://apis.roblox.com/toolbox-service/v2/assets:search"
-
-    # Model is Roblox AssetType 10. Never use assetType=8: 8 is Hat and the
-    # current Creator Store endpoint rejects it for this search API.
-    attempts = [
-        {
-            "query": query,
-            "assetTypes": [10],
-            "maxPageSize": max(limit, 1),
-        },
-        # Compatibility fallback: search without an asset filter and keep only
-        # models while normalizing the returned items.
-        {
-            "query": query,
-            "maxPageSize": min(100, max(limit * 3, 30)),
-        },
-    ]
-
-    for body in attempts:
-        try:
-            payload = roblox_json_request("POST", endpoint, json=body)
-            models = normalize_model_items(payload, limit)
-            if models:
-                break
-        except Exception as e:
-            errors.append(str(e))
-
-    if not models and errors:
-        unique_errors: List[str] = []
-        for error in errors:
-            if error not in unique_errors:
-                unique_errors.append(error)
-        raise RuntimeError(unique_errors[-1])
-
+    page_size = max(1, min(100, int(limit)))
+    params = {
+        "searchCategoryType": "Model",
+        "maxPageSize": page_size,
+    }
+    body = {
+        "query": query,
+    }
+    payload = roblox_json_request(
+        "POST",
+        endpoint,
+        require_open_cloud=True,
+        headers={"Content-Type": "application/json"},
+        params=params,
+        json=body,
+    )
+    models = normalize_model_items(payload, limit)
     thumbs = fetch_model_thumbnails([item["id"] for item in models])
     for item in models:
         item["thumbnail"] = thumbs.get(item["id"], "")
@@ -1378,7 +1380,11 @@ def admin_login():
     if not admin_authorized():
         time.sleep(0.15)
         return json_error("Bad admin key", 403)
-    return jsonify({"ok": True, "version": APP_VERSION})
+    return jsonify({
+        "ok": True,
+        "version": APP_VERSION,
+        "roblox_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
+    })
 
 
 @app.route("/admin/models/search", methods=["GET"])
@@ -1390,6 +1396,12 @@ def admin_models_search():
     if len(query) < 2:
         return json_error("Enter at least 2 characters", 400)
     limit = read_int_arg(request.args, "limit", 24, 1, 30)
+    if not ROBLOX_OPEN_CLOUD_KEY:
+        return json_error(
+            "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY in Render Environment.",
+            503,
+            {"setup_required": True},
+        )
     try:
         models = search_creator_store_models(query, limit)
     except Exception as e:
@@ -1426,7 +1438,9 @@ def version():
         "ok": True,
         "version": APP_VERSION,
         "search_endpoint": "/toolbox-service/v2/assets:search",
+        "search_category_type": "Model",
         "model_asset_type": 10,
+        "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
     })
 
 
