@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v9-query-2026-07-11"
+APP_VERSION = "model-search-v10-pages-3d-filter-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -93,6 +93,10 @@ HTML = r'''
         .model-meta { min-height: 34px; margin: 6px 0 10px; color: #9797a6; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
         .model-card button { padding: 10px; }
         .empty-models { grid-column: 1 / -1; padding: 28px 14px; text-align: center; color: #9797a6; border: 1px dashed #333441; border-radius: 14px; }
+        .model-pagination { display: none; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; margin-top: 16px; }
+        .model-pagination.visible { display: grid; }
+        .model-pagination button { width: 100%; }
+        .model-page-label { min-width: 86px; text-align: center; color: #b7b7c4; font-size: 13px; }
         .admin-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
         .admin-row button { width: auto; padding: 9px 12px; }
         .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 18px; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
@@ -218,7 +222,12 @@ HTML = r'''
                 </div>
                 <div id="modelStatus" class="status">Enter a model name.</div>
                 <div id="modelResults" class="model-grid"></div>
-                <div class="download-note">Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. XML models are returned as .rbxmx; binary models are returned as .rbxm.</div>
+                <div id="modelPagination" class="model-pagination">
+                    <button id="modelPrevBtn" type="button" class="secondary">Previous</button>
+                    <div id="modelPageLabel" class="model-page-label">Page 1</div>
+                    <button id="modelNextBtn" type="button" class="secondary">Next</button>
+                </div>
+                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets.</div>
             </div>
         </div>
     </div>
@@ -248,6 +257,10 @@ const state = {
     videoConverted: false,
     adminKey: '',
     modelBusy: false,
+    modelQuery: '',
+    modelPageTokens: [''],
+    modelPageIndex: 0,
+    modelNextPageToken: '',
     imageSettingsTimer: null,
     videoSettingsTimer: null,
     busyImage: false,
@@ -342,19 +355,40 @@ function cardElement(model) {
     card.append(img, body);
     return card;
 }
-async function searchModels() {
+function updateModelPagination() {
+    const hasPrevious = state.modelPageIndex > 0;
+    const hasNext = !!state.modelNextPageToken;
+    $('modelPrevBtn').disabled = state.modelBusy || !hasPrevious;
+    $('modelNextBtn').disabled = state.modelBusy || !hasNext;
+    $('modelPageLabel').textContent = 'Page ' + (state.modelPageIndex + 1);
+    $('modelPagination').classList.toggle('visible', hasPrevious || hasNext || state.modelPageIndex > 0);
+}
+async function searchModels(options) {
     if (state.modelBusy) return;
+    options = options || {};
     const query = String($('modelQuery').value || '').trim();
     if (query.length < 2) {
         $('modelStatus').textContent = 'Enter at least 2 characters.';
         return;
     }
+    const reset = options.reset !== false;
+    if (reset || query !== state.modelQuery) {
+        state.modelQuery = query;
+        state.modelPageTokens = [''];
+        state.modelPageIndex = 0;
+        state.modelNextPageToken = '';
+    }
+    const requestedIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : state.modelPageIndex;
+    const pageToken = safeText(state.modelPageTokens[requestedIndex] || '');
     state.modelBusy = true;
     $('modelSearchBtn').disabled = true;
     $('modelStatus').textContent = 'Searching Roblox Creator Store...';
     $('modelResults').replaceChildren();
+    updateModelPagination();
     try {
-        const res = await fetch('/admin/models/search?q=' + encodeURIComponent(query) + '&limit=24&_=' + Date.now(), {
+        const params = new URLSearchParams({ q: query, limit: '24', _: String(Date.now()) });
+        if (pageToken) params.set('page_token', pageToken);
+        const res = await fetch('/admin/models/search?' + params.toString(), {
             cache: 'no-store',
             headers: adminHeaders({ 'Accept': 'application/json' })
         });
@@ -366,12 +400,26 @@ async function searchModels() {
             throw new Error(data.error || 'Admin access expired');
         }
         if (!res.ok || !data.ok) throw new Error(data.error || 'Search failed');
+        state.modelPageIndex = requestedIndex;
+        state.modelNextPageToken = safeText(data.next_page_token || '');
+        if (state.modelNextPageToken) {
+            state.modelPageTokens[requestedIndex + 1] = state.modelNextPageToken;
+            state.modelPageTokens.length = requestedIndex + 2;
+        } else {
+            state.modelPageTokens.length = requestedIndex + 1;
+        }
         const models = Array.isArray(data.models) ? data.models : [];
-        $('modelStatus').textContent = models.length ? ('Found ' + models.length + ' models.') : 'No models found.';
+        const filtered = Number(data.filtered_count || 0);
+        const suffix = filtered > 0 ? (' · hidden image-only: ' + filtered) : '';
+        $('modelStatus').textContent = models.length
+            ? ('Page ' + (requestedIndex + 1) + ' · ' + models.length + ' 3D models' + suffix)
+            : ('No 3D models on this page' + suffix + (state.modelNextPageToken ? '. Try Next.' : '.'));
         if (!models.length) {
             const empty = document.createElement('div');
             empty.className = 'empty-models';
-            empty.textContent = 'No matching public models.';
+            empty.textContent = state.modelNextPageToken
+                ? 'This page only contained image-like assets. Open the next page.'
+                : 'No matching public 3D models.';
             $('modelResults').appendChild(empty);
         } else {
             models.forEach(model => $('modelResults').appendChild(cardElement(model)));
@@ -381,7 +429,18 @@ async function searchModels() {
     } finally {
         state.modelBusy = false;
         $('modelSearchBtn').disabled = false;
+        updateModelPagination();
     }
+}
+async function openPreviousModelPage() {
+    if (state.modelBusy || state.modelPageIndex <= 0) return;
+    await searchModels({ reset: false, pageIndex: state.modelPageIndex - 1 });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+async function openNextModelPage() {
+    if (state.modelBusy || !state.modelNextPageToken) return;
+    await searchModels({ reset: false, pageIndex: state.modelPageIndex + 1 });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 function responseFilename(res, fallback) {
     const value = res.headers.get('Content-Disposition') || '';
@@ -431,8 +490,10 @@ $('modelsTabBtn').onclick = showAdminModal;
 $('adminCancelBtn').onclick = hideAdminModal;
 $('adminLoginBtn').onclick = openModelBrowser;
 $('adminLogoutBtn').onclick = () => switchPanel('painter');
-$('modelSearchBtn').onclick = searchModels;
-$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels(); });
+$('modelSearchBtn').onclick = () => searchModels({ reset: true, pageIndex: 0 });
+$('modelPrevBtn').onclick = openPreviousModelPage;
+$('modelNextBtn').onclick = openNextModelPage;
+$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels({ reset: true, pageIndex: 0 }); });
 $('adminKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') openModelBrowser(); });
 $('adminModal').addEventListener('click', e => { if (e.target === $('adminModal')) hideAdminModal(); });
 
@@ -1147,12 +1208,79 @@ def normalize_creator(value: Any) -> str:
     return str(value)
 
 
-def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+IMAGE_ONLY_PATTERNS = (
+    re.compile(r"\bsky[\s_-]*box(?:es)?\b", re.IGNORECASE),
+    re.compile(r"\bdecal(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\btexture(?:s|\s*pack)?\b", re.IGNORECASE),
+    re.compile(r"\bimage(?:s|\s*pack)?\b", re.IGNORECASE),
+    re.compile(r"\bphoto(?:s|graph|graphic)?\b", re.IGNORECASE),
+    re.compile(r"\bpicture(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bwallpaper(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bcube[\s_-]*map(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bpanorama(?:s|mic)?\b", re.IGNORECASE),
+    re.compile(r"\bthumbnail(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bsprite(?:s|\s*sheet)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:png|jpe?g|webp|bmp|gif)\b", re.IGNORECASE),
+)
+
+
+def model_is_image_only(item: Dict[str, Any], asset: Dict[str, Any]) -> bool:
+    type_value = first_nonempty(asset, ("typeId", "assetTypeId", "assetType", "assetTypeName", "type"))
+    if type_value is None:
+        type_value = first_nonempty(item, ("typeId", "assetTypeId", "assetType", "assetTypeName", "type"))
+    if isinstance(type_value, int):
+        if type_value != 10:
+            return True
+    else:
+        type_text = str(type_value or "").strip().lower()
+        if type_text and type_text not in ("10", "model") and "model" not in type_text:
+            return True
+
+    searchable_parts = []
+    for source in (asset, item):
+        for key in (
+            "name", "displayName", "title", "description", "summary",
+            "categoryPath", "category", "subcategory", "assetTypeName", "type",
+        ):
+            value = source.get(key)
+            if isinstance(value, (str, int, float)):
+                searchable_parts.append(str(value))
+        tags = source.get("tags")
+        if isinstance(tags, list):
+            searchable_parts.extend(str(tag) for tag in tags if isinstance(tag, (str, int, float)))
+    searchable = " ".join(searchable_parts)
+    return any(pattern.search(searchable) for pattern in IMAGE_ONLY_PATTERNS)
+
+
+def find_next_page_token(payload: Any) -> str:
+    token_names = (
+        "nextPageToken", "next_page_token", "nextPageCursor", "nextCursor",
+        "continuationToken", "nextContinuationToken",
+    )
+    if isinstance(payload, dict):
+        for name in token_names:
+            value = payload.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for container_name in ("pagination", "pageInfo", "metadata", "responseMetadata"):
+            nested = payload.get(container_name)
+            if isinstance(nested, dict):
+                token = find_next_page_token(nested)
+                if token:
+                    return token
+    return ""
+
+
+def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dict[str, Any]], int]:
     items = find_asset_list(payload)
     models: List[Dict[str, Any]] = []
     seen = set()
+    filtered_count = 0
     for item in items:
         asset = item.get("asset") if isinstance(item.get("asset"), dict) else item
+        if model_is_image_only(item, asset):
+            filtered_count += 1
+            continue
         asset_id = first_nonempty(asset, ("id", "assetId", "assetID", "asset_id"))
         if asset_id is None:
             asset_id = first_nonempty(item, ("id", "assetId", "assetID", "asset_id"))
@@ -1161,12 +1289,6 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str,
         except Exception:
             continue
         if asset_id <= 0 or asset_id in seen:
-            continue
-        type_id = first_nonempty(asset, ("typeId", "assetTypeId", "assetType"))
-        if isinstance(type_id, int) and type_id != 10:
-            continue
-        type_text = str(type_id or "").upper()
-        if type_text and "MODEL" not in type_text and type_text != "10":
             continue
         name = str(first_nonempty(asset, ("name", "displayName", "title"), f"Model {asset_id}"))
         creator_value = asset.get("creator", item.get("creator"))
@@ -1178,11 +1300,12 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str,
             "creator": creator,
             "description": description,
             "thumbnail": "",
+            "asset_type": "Model",
         })
         seen.add(asset_id)
         if len(models) >= limit:
             break
-    return models
+    return models, filtered_count
 
 
 def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
@@ -1219,7 +1342,7 @@ def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
     return result
 
 
-def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
+def search_creator_store_models(query: str, limit: int, page_token: str = "") -> Dict[str, Any]:
     if not ROBLOX_OPEN_CLOUD_KEY:
         raise RuntimeError(
             "Creator Store search is not configured. Set ROBLOX_OPEN_CLOUD_KEY in Render Environment."
@@ -1232,6 +1355,8 @@ def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
         "maxPageSize": page_size,
         "query": query,
     }
+    if page_token:
+        search_params["pageToken"] = page_token
     response = requests.get(
         endpoint,
         params=search_params,
@@ -1277,11 +1402,15 @@ def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         raise RuntimeError("Unexpected Roblox response")
 
-    models = normalize_model_items(payload, limit)
+    models, filtered_count = normalize_model_items(payload, limit)
     thumbs = fetch_model_thumbnails([item["id"] for item in models])
     for item in models:
         item["thumbnail"] = thumbs.get(item["id"], "")
-    return models
+    return {
+        "models": models,
+        "next_page_token": find_next_page_token(payload),
+        "filtered_count": filtered_count,
+    }
 
 
 def read_limited_response(response: requests.Response) -> bytes:
@@ -1432,6 +1561,9 @@ def admin_models_search():
     if len(query) < 2:
         return json_error("Enter at least 2 characters", 400)
     limit = read_int_arg(request.args, "limit", 24, 1, 30)
+    page_token = request.args.get("page_token", "").strip()
+    if len(page_token) > 4096:
+        return json_error("Bad page token", 400)
     if not ROBLOX_OPEN_CLOUD_KEY:
         return json_error(
             "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY in Render Environment.",
@@ -1439,16 +1571,21 @@ def admin_models_search():
             {"setup_required": True},
         )
     try:
-        models = search_creator_store_models(query, limit)
+        result = search_creator_store_models(query, limit, page_token)
     except Exception as e:
         return json_error("Roblox search failed: " + str(e), 502)
+    models = result.get("models", [])
     response = jsonify({
         "ok": True,
         "query": query,
         "models": models,
         "count": len(models),
+        "filtered_count": int(result.get("filtered_count", 0)),
+        "next_page_token": str(result.get("next_page_token", "")),
+        "has_next_page": bool(result.get("next_page_token")),
         "version": APP_VERSION,
         "upstream_query_parameter": "query",
+        "upstream_page_parameter": "pageToken",
     })
     response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
@@ -1484,7 +1621,9 @@ def version():
         "version": APP_VERSION,
         "search_endpoint": "/toolbox-service/v2/assets:search",
         "search_method": "GET",
-        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle",
+        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
+        "pagination": "nextPageToken -> pageToken",
+        "image_only_filter": True,
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
