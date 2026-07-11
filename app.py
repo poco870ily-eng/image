@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v8-get-2026-07-11"
+APP_VERSION = "model-search-v9-query-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -354,7 +354,8 @@ async function searchModels() {
     $('modelStatus').textContent = 'Searching Roblox Creator Store...';
     $('modelResults').replaceChildren();
     try {
-        const res = await fetch('/admin/models/search?q=' + encodeURIComponent(query) + '&limit=24', {
+        const res = await fetch('/admin/models/search?q=' + encodeURIComponent(query) + '&limit=24&_=' + Date.now(), {
+            cache: 'no-store',
             headers: adminHeaders({ 'Accept': 'application/json' })
         });
         const data = await parseJson(res);
@@ -1225,13 +1226,15 @@ def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
         )
 
     page_size = max(1, min(100, int(limit)))
-    encoded_query = quote_plus(query)
-    endpoint = (
-        "https://apis.roblox.com/toolbox-service/v2/assets:search"
-        f"?searchCategoryType=Model&maxPageSize={page_size}&keyword={encoded_query}"
-    )
+    endpoint = "https://apis.roblox.com/toolbox-service/v2/assets:search"
+    search_params = {
+        "searchCategoryType": "Model",
+        "maxPageSize": page_size,
+        "query": query,
+    }
     response = requests.get(
         endpoint,
+        params=search_params,
         headers={
             "Accept": "application/json",
             "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
@@ -1439,7 +1442,16 @@ def admin_models_search():
         models = search_creator_store_models(query, limit)
     except Exception as e:
         return json_error("Roblox search failed: " + str(e), 502)
-    return jsonify({"ok": True, "query": query, "models": models, "count": len(models), "version": APP_VERSION})
+    response = jsonify({
+        "ok": True,
+        "query": query,
+        "models": models,
+        "count": len(models),
+        "version": APP_VERSION,
+        "upstream_query_parameter": "query",
+    })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.route("/admin/models/download/<asset_id>", methods=["GET"])
@@ -1472,7 +1484,7 @@ def version():
         "version": APP_VERSION,
         "search_endpoint": "/toolbox-service/v2/assets:search",
         "search_method": "GET",
-        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&keyword=castle",
+        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle",
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
