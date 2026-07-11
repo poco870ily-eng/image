@@ -16,6 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
+APP_VERSION = "model-search-v4-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -112,6 +113,7 @@ HTML = r'''
 <div class="wrap">
     <div class="box">
         <h1>Nameless Tools</h1>
+        <div class="mini">Build {{ app_version }}</div>
         <div class="tabs">
             <button id="painterTabBtn" class="tab-btn active" type="button">Image / Video</button>
             <button id="modelsTabBtn" class="tab-btn" type="button">Model Browser</button>
@@ -1145,10 +1147,10 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str,
         if asset_id <= 0 or asset_id in seen:
             continue
         type_id = first_nonempty(asset, ("typeId", "assetTypeId", "assetType"))
-        if isinstance(type_id, int) and type_id not in (8, 10):
+        if isinstance(type_id, int) and type_id != 10:
             continue
         type_text = str(type_id or "").upper()
-        if type_text and "MODEL" not in type_text and type_text not in ("8", "10"):
+        if type_text and "MODEL" not in type_text and type_text != "10":
             continue
         name = str(first_nonempty(asset, ("name", "displayName", "title"), f"Model {asset_id}"))
         creator_value = asset.get("creator", item.get("creator"))
@@ -1202,49 +1204,41 @@ def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
 
 
 def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
-    # The documented v2 search endpoint is attempted first. Roblox has changed
-    # protobuf JSON field names over time, so a legacy read-only search fallback
-    # remains for compatibility.
-    errors = []
-    v2_payloads = [
-        {"query": query, "assetTypes": ["ASSET_TYPE_MODEL"], "maxPageSize": limit},
-        {"query": query, "assetTypes": ["MODEL"], "limit": limit},
-        {"keyword": query, "assetTypes": [10], "limit": limit},
+    errors: List[str] = []
+    models: List[Dict[str, Any]] = []
+    endpoint = "https://apis.roblox.com/toolbox-service/v2/assets:search"
+
+    # Model is Roblox AssetType 10. Never use assetType=8: 8 is Hat and the
+    # current Creator Store endpoint rejects it for this search API.
+    attempts = [
+        {
+            "query": query,
+            "assetTypes": [10],
+            "maxPageSize": max(limit, 1),
+        },
+        # Compatibility fallback: search without an asset filter and keep only
+        # models while normalizing the returned items.
+        {
+            "query": query,
+            "maxPageSize": min(100, max(limit * 3, 30)),
+        },
     ]
-    for body in v2_payloads:
+
+    for body in attempts:
         try:
-            payload = roblox_json_request(
-                "POST",
-                "https://apis.roblox.com/toolbox-service/v2/assets:search",
-                json=body,
-            )
+            payload = roblox_json_request("POST", endpoint, json=body)
             models = normalize_model_items(payload, limit)
             if models:
                 break
         except Exception as e:
             errors.append(str(e))
-            models = []
-    else:
-        models = []
-
-    if not models:
-        try:
-            payload = roblox_json_request(
-                "GET",
-                "https://apis.roblox.com/toolbox-service/v1/marketplace/8",
-                params={
-                    "keyword": query,
-                    "limit": limit,
-                    "pageNumber": 1,
-                    "includeOnlyVerifiedCreators": "false",
-                },
-            )
-            models = normalize_model_items(payload, limit)
-        except Exception as e:
-            errors.append(str(e))
 
     if not models and errors:
-        raise RuntimeError(errors[-1])
+        unique_errors: List[str] = []
+        for error in errors:
+            if error not in unique_errors:
+                unique_errors.append(error)
+        raise RuntimeError(unique_errors[-1])
 
     thumbs = fetch_model_thumbnails([item["id"] for item in models])
     for item in models:
@@ -1384,7 +1378,7 @@ def admin_login():
     if not admin_authorized():
         time.sleep(0.15)
         return json_error("Bad admin key", 403)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 @app.route("/admin/models/search", methods=["GET"])
@@ -1400,7 +1394,7 @@ def admin_models_search():
         models = search_creator_store_models(query, limit)
     except Exception as e:
         return json_error("Roblox search failed: " + str(e), 502)
-    return jsonify({"ok": True, "query": query, "models": models, "count": len(models)})
+    return jsonify({"ok": True, "query": query, "models": models, "count": len(models), "version": APP_VERSION})
 
 
 @app.route("/admin/models/download/<asset_id>", methods=["GET"])
@@ -1426,6 +1420,22 @@ def admin_models_download(asset_id: str):
     return response
 
 
+@app.route("/version", methods=["GET"])
+def version():
+    return jsonify({
+        "ok": True,
+        "version": APP_VERSION,
+        "search_endpoint": "/toolbox-service/v2/assets:search",
+        "model_asset_type": 10,
+    })
+
+
+@app.after_request
+def add_version_header(response):
+    response.headers["X-App-Version"] = APP_VERSION
+    return response
+
+
 # ---------- routes ----------
 @app.route("/", methods=["GET"])
 def index():
@@ -1443,6 +1453,7 @@ def index():
         abs_max_res=ABS_MAX_RES,
         video_max_res=VIDEO_MAX_RES,
         video_max_frames=VIDEO_MAX_FRAMES,
+        app_version=APP_VERSION,
     )
 
 
