@@ -1,7 +1,9 @@
 import hmac
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 import traceback
 from urllib.parse import quote_plus, urlparse
@@ -9,14 +11,16 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, session
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v9-download-2026-07-11"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+APP_VERSION = "model-search-v16-direct-redirect-notice-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -27,6 +31,8 @@ DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
 VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
 IMAGE_SETTINGS_DIR = os.environ.get("IMAGE_SETTINGS_DIR", "image_settings")
+MODEL_DOWNLOAD_DIR = os.environ.get("MODEL_DOWNLOAD_DIR", "model_downloads")
+MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", "300"))))
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -38,7 +44,7 @@ VIDEO_MAX_CHUNK_FRAMES = int(os.environ.get("VIDEO_MAX_CHUNK_FRAMES", "12"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 
-for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR):
+for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR, MODEL_DOWNLOAD_DIR):
     os.makedirs(path, exist_ok=True)
 
 HTML = r'''
@@ -93,6 +99,10 @@ HTML = r'''
         .model-meta { min-height: 34px; margin: 6px 0 10px; color: #9797a6; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
         .model-card button { padding: 10px; }
         .empty-models { grid-column: 1 / -1; padding: 28px 14px; text-align: center; color: #9797a6; border: 1px dashed #333441; border-radius: 14px; }
+        .model-pagination { display: none; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; margin-top: 16px; }
+        .model-pagination.visible { display: grid; }
+        .model-pagination button { width: 100%; }
+        .model-page-label { min-width: 86px; text-align: center; color: #b7b7c4; font-size: 13px; }
         .admin-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
         .admin-row button { width: auto; padding: 9px 12px; }
         .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 18px; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
@@ -204,7 +214,7 @@ HTML = r'''
             <div class="admin-row">
                 <div>
                     <h2>Roblox Model Browser</h2>
-                    <div class="hint">Search public Creator Store models and download the model file returned by Roblox.</div>
+                    <div class="hint">Search public Creator Store models and open the original Roblox download link.</div>
                 </div>
                 <button id="adminLogoutBtn" type="button" class="secondary">Lock</button>
             </div>
@@ -218,7 +228,12 @@ HTML = r'''
                 </div>
                 <div id="modelStatus" class="status">Enter a model name.</div>
                 <div id="modelResults" class="model-grid"></div>
-                <div class="download-note">Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. XML models are returned as .rbxmx; binary models are returned as .rbxm.</div>
+                <div id="modelPagination" class="model-pagination">
+                    <button id="modelPrevBtn" type="button" class="secondary">Previous</button>
+                    <div id="modelPageLabel" class="model-page-label">Page 1</div>
+                    <button id="modelNextBtn" type="button" class="secondary">Next</button>
+                </div>
+                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Before Roblox opens, the site reminds you to rename the downloaded file and add the .rbxm extension.</div>
             </div>
         </div>
     </div>
@@ -248,6 +263,10 @@ const state = {
     videoConverted: false,
     adminKey: '',
     modelBusy: false,
+    modelQuery: '',
+    modelPageTokens: [''],
+    modelPageIndex: 0,
+    modelNextPageToken: '',
     imageSettingsTimer: null,
     videoSettingsTimer: null,
     busyImage: false,
@@ -342,19 +361,41 @@ function cardElement(model) {
     card.append(img, body);
     return card;
 }
-async function searchModels() {
+function updateModelPagination() {
+    const hasPrevious = state.modelPageIndex > 0;
+    const hasNext = !!state.modelNextPageToken;
+    $('modelPrevBtn').disabled = state.modelBusy || !hasPrevious;
+    $('modelNextBtn').disabled = state.modelBusy || !hasNext;
+    $('modelPageLabel').textContent = 'Page ' + (state.modelPageIndex + 1);
+    $('modelPagination').classList.toggle('visible', hasPrevious || hasNext || state.modelPageIndex > 0);
+}
+async function searchModels(options) {
     if (state.modelBusy) return;
+    options = options || {};
     const query = String($('modelQuery').value || '').trim();
     if (query.length < 2) {
         $('modelStatus').textContent = 'Enter at least 2 characters.';
         return;
     }
+    const reset = options.reset !== false;
+    if (reset || query !== state.modelQuery) {
+        state.modelQuery = query;
+        state.modelPageTokens = [''];
+        state.modelPageIndex = 0;
+        state.modelNextPageToken = '';
+    }
+    const requestedIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : state.modelPageIndex;
+    const pageToken = safeText(state.modelPageTokens[requestedIndex] || '');
     state.modelBusy = true;
     $('modelSearchBtn').disabled = true;
     $('modelStatus').textContent = 'Searching Roblox Creator Store...';
     $('modelResults').replaceChildren();
+    updateModelPagination();
     try {
-        const res = await fetch('/admin/models/search?q=' + encodeURIComponent(query) + '&limit=24', {
+        const params = new URLSearchParams({ q: query, limit: '24', _: String(Date.now()) });
+        if (pageToken) params.set('page_token', pageToken);
+        const res = await fetch('/admin/models/search?' + params.toString(), {
+            cache: 'no-store',
             headers: adminHeaders({ 'Accept': 'application/json' })
         });
         const data = await parseJson(res);
@@ -365,12 +406,26 @@ async function searchModels() {
             throw new Error(data.error || 'Admin access expired');
         }
         if (!res.ok || !data.ok) throw new Error(data.error || 'Search failed');
+        state.modelPageIndex = requestedIndex;
+        state.modelNextPageToken = safeText(data.next_page_token || '');
+        if (state.modelNextPageToken) {
+            state.modelPageTokens[requestedIndex + 1] = state.modelNextPageToken;
+            state.modelPageTokens.length = requestedIndex + 2;
+        } else {
+            state.modelPageTokens.length = requestedIndex + 1;
+        }
         const models = Array.isArray(data.models) ? data.models : [];
-        $('modelStatus').textContent = models.length ? ('Found ' + models.length + ' models.') : 'No models found.';
+        const filtered = Number(data.filtered_count || 0);
+        const suffix = filtered > 0 ? (' · hidden image-only: ' + filtered) : '';
+        $('modelStatus').textContent = models.length
+            ? ('Page ' + (requestedIndex + 1) + ' · ' + models.length + ' 3D models' + suffix)
+            : ('No 3D models on this page' + suffix + (state.modelNextPageToken ? '. Try Next.' : '.'));
         if (!models.length) {
             const empty = document.createElement('div');
             empty.className = 'empty-models';
-            empty.textContent = 'No matching public models.';
+            empty.textContent = state.modelNextPageToken
+                ? 'This page only contained image-like assets. Open the next page.'
+                : 'No matching public 3D models.';
             $('modelResults').appendChild(empty);
         } else {
             models.forEach(model => $('modelResults').appendChild(cardElement(model)));
@@ -380,7 +435,18 @@ async function searchModels() {
     } finally {
         state.modelBusy = false;
         $('modelSearchBtn').disabled = false;
+        updateModelPagination();
     }
+}
+async function openPreviousModelPage() {
+    if (state.modelBusy || state.modelPageIndex <= 0) return;
+    await searchModels({ reset: false, pageIndex: state.modelPageIndex - 1 });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+async function openNextModelPage() {
+    if (state.modelBusy || !state.modelNextPageToken) return;
+    await searchModels({ reset: false, pageIndex: state.modelPageIndex + 1 });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 function responseFilename(res, fallback) {
     const value = res.headers.get('Content-Disposition') || '';
@@ -391,47 +457,34 @@ function responseFilename(res, fallback) {
     const normal = value.match(/filename="?([^";]+)"?/i);
     return normal ? normal[1] : fallback;
 }
-async function downloadModel(model, button) {
-    const oldText = button.textContent;
-    button.disabled = true;
-    button.textContent = 'Downloading...';
-    try {
-        const res = await fetch('/admin/models/download/' + encodeURIComponent(model.id), {
-            headers: adminHeaders()
-        });
-        if (!res.ok) {
-            let message = 'Download failed';
-            try {
-                const data = await parseJson(res);
-                message = data.error || message;
-            } catch (e) {}
-            throw new Error(message);
-        }
-        const blob = await res.blob();
-        const filename = responseFilename(res, 'model_' + model.id + '.rbxm');
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1500);
-        $('modelStatus').textContent = 'Downloaded: ' + filename;
-    } catch (e) {
-        $('modelStatus').textContent = 'Download error: ' + (e && e.message ? e.message : e);
-    } finally {
-        button.disabled = false;
-        button.textContent = oldText;
+function downloadModel(model, button) {
+    const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
+    if (!assetId) {
+        $('modelStatus').textContent = 'Download error: bad Asset ID';
+        return;
     }
+
+    const modelName = safeText(model && model.name ? model.name : ('model_' + assetId));
+    const downloadUrl = 'https://assetdelivery.roblox.com/v1/asset?id=' + encodeURIComponent(assetId);
+
+    $('modelStatus').textContent = 'After downloading, rename the file and add .rbxm';
+    alert(
+        'Roblox will now open the original download link.\n\n' +
+        'After the file downloads, rename it and add this extension:\n.rbxm\n\n' +
+        'Suggested name: ' + modelName + '.rbxm'
+    );
+
+    window.location.assign(downloadUrl);
 }
 $('painterTabBtn').onclick = () => switchPanel('painter');
 $('modelsTabBtn').onclick = showAdminModal;
 $('adminCancelBtn').onclick = hideAdminModal;
 $('adminLoginBtn').onclick = openModelBrowser;
 $('adminLogoutBtn').onclick = () => switchPanel('painter');
-$('modelSearchBtn').onclick = searchModels;
-$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels(); });
+$('modelSearchBtn').onclick = () => searchModels({ reset: true, pageIndex: 0 });
+$('modelPrevBtn').onclick = openPreviousModelPage;
+$('modelNextBtn').onclick = openNextModelPage;
+$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels({ reset: true, pageIndex: 0 }); });
 $('adminKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') openModelBrowser(); });
 $('adminModal').addEventListener('click', e => { if (e.target === $('adminModal')) hideAdminModal(); });
 
@@ -1052,6 +1105,8 @@ def admin_key_from_request() -> str:
 
 
 def admin_authorized() -> bool:
+    if session.get("admin_authorized") is True:
+        return True
     supplied = admin_key_from_request()
     return bool(supplied) and hmac.compare_digest(supplied, ADMIN_KEY)
 
@@ -1146,26 +1201,91 @@ def normalize_creator(value: Any) -> str:
     return str(value)
 
 
-def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+IMAGE_ONLY_PATTERNS = (
+    re.compile(r"\bsky[\s_-]*box(?:es)?\b", re.IGNORECASE),
+    re.compile(r"\bdecal(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\btexture(?:s|\s*pack)?\b", re.IGNORECASE),
+    re.compile(r"\bimage(?:s|\s*pack)?\b", re.IGNORECASE),
+    re.compile(r"\bphoto(?:s|graph|graphic)?\b", re.IGNORECASE),
+    re.compile(r"\bpicture(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bwallpaper(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bcube[\s_-]*map(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bpanorama(?:s|mic)?\b", re.IGNORECASE),
+    re.compile(r"\bthumbnail(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bsprite(?:s|\s*sheet)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:png|jpe?g|webp|bmp|gif)\b", re.IGNORECASE),
+)
+
+
+def model_is_image_only(item: Dict[str, Any], asset: Dict[str, Any]) -> bool:
+    type_value = first_nonempty(asset, ("typeId", "assetTypeId", "assetType", "assetTypeName", "type"))
+    if type_value is None:
+        type_value = first_nonempty(item, ("typeId", "assetTypeId", "assetType", "assetTypeName", "type"))
+    if isinstance(type_value, int):
+        if type_value != 10:
+            return True
+    else:
+        type_text = str(type_value or "").strip().lower()
+        if type_text and type_text not in ("10", "model") and "model" not in type_text:
+            return True
+
+    searchable_parts = []
+    for source in (asset, item):
+        for key in (
+            "name", "displayName", "title", "description", "summary",
+            "categoryPath", "category", "subcategory", "assetTypeName", "type",
+        ):
+            value = source.get(key)
+            if isinstance(value, (str, int, float)):
+                searchable_parts.append(str(value))
+        tags = source.get("tags")
+        if isinstance(tags, list):
+            searchable_parts.extend(str(tag) for tag in tags if isinstance(tag, (str, int, float)))
+    searchable = " ".join(searchable_parts)
+    return any(pattern.search(searchable) for pattern in IMAGE_ONLY_PATTERNS)
+
+
+def find_next_page_token(payload: Any) -> str:
+    token_names = (
+        "nextPageToken", "next_page_token", "nextPageCursor", "nextCursor",
+        "continuationToken", "nextContinuationToken",
+    )
+    if isinstance(payload, dict):
+        for name in token_names:
+            value = payload.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for container_name in ("pagination", "pageInfo", "metadata", "responseMetadata"):
+            nested = payload.get(container_name)
+            if isinstance(nested, dict):
+                token = find_next_page_token(nested)
+                if token:
+                    return token
+    return ""
+
+
+def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dict[str, Any]], int]:
     items = find_asset_list(payload)
     models: List[Dict[str, Any]] = []
     seen = set()
+    filtered_count = 0
     for item in items:
         asset = item.get("asset") if isinstance(item.get("asset"), dict) else item
-        asset_id = first_nonempty(asset, ("id", "assetId", "assetID", "asset_id"))
+        if model_is_image_only(item, asset):
+            filtered_count += 1
+            continue
+        asset_id = first_nonempty(asset, ("assetId", "assetID", "asset_id"))
         if asset_id is None:
-            asset_id = first_nonempty(item, ("id", "assetId", "assetID", "asset_id"))
+            asset_id = first_nonempty(item, ("assetId", "assetID", "asset_id"))
+        if asset_id is None:
+            asset_id = first_nonempty(asset, ("id",))
+        if asset_id is None:
+            asset_id = first_nonempty(item, ("id",))
         try:
             asset_id = int(asset_id)
         except Exception:
             continue
         if asset_id <= 0 or asset_id in seen:
-            continue
-        type_id = first_nonempty(asset, ("typeId", "assetTypeId", "assetType"))
-        if isinstance(type_id, int) and type_id != 10:
-            continue
-        type_text = str(type_id or "").upper()
-        if type_text and "MODEL" not in type_text and type_text != "10":
             continue
         name = str(first_nonempty(asset, ("name", "displayName", "title"), f"Model {asset_id}"))
         creator_value = asset.get("creator", item.get("creator"))
@@ -1177,11 +1297,12 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> List[Dict[str,
             "creator": creator,
             "description": description,
             "thumbnail": "",
+            "asset_type": "Model",
         })
         seen.add(asset_id)
         if len(models) >= limit:
             break
-    return models
+    return models, filtered_count
 
 
 def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
@@ -1218,20 +1339,24 @@ def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
     return result
 
 
-def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
+def search_creator_store_models(query: str, limit: int, page_token: str = "") -> Dict[str, Any]:
     if not ROBLOX_OPEN_CLOUD_KEY:
         raise RuntimeError(
             "Creator Store search is not configured. Set ROBLOX_OPEN_CLOUD_KEY in Render Environment."
         )
 
     page_size = max(1, min(100, int(limit)))
-    encoded_query = quote_plus(query)
-    endpoint = (
-        "https://apis.roblox.com/toolbox-service/v2/assets:search"
-        f"?searchCategoryType=Model&maxPageSize={page_size}&keyword={encoded_query}"
-    )
+    endpoint = "https://apis.roblox.com/toolbox-service/v2/assets:search"
+    search_params = {
+        "searchCategoryType": "Model",
+        "maxPageSize": page_size,
+        "query": query,
+    }
+    if page_token:
+        search_params["pageToken"] = page_token
     response = requests.get(
         endpoint,
+        params=search_params,
         headers={
             "Accept": "application/json",
             "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
@@ -1274,11 +1399,15 @@ def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         raise RuntimeError("Unexpected Roblox response")
 
-    models = normalize_model_items(payload, limit)
+    models, filtered_count = normalize_model_items(payload, limit)
     thumbs = fetch_model_thumbnails([item["id"] for item in models])
     for item in models:
         item["thumbnail"] = thumbs.get(item["id"], "")
-    return models
+    return {
+        "models": models,
+        "next_page_token": find_next_page_token(payload),
+        "filtered_count": filtered_count,
+    }
 
 
 def read_limited_response(response: requests.Response) -> bytes:
@@ -1318,7 +1447,7 @@ def trusted_roblox_location(url: str) -> bool:
 
 def find_download_location(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
-        for key in ("location", "url", "downloadUrl", "downloadURL"):
+        for key in ("location", "url", "downloadUrl", "downloadURL", "signedUrl", "signedURL"):
             value = payload.get(key)
             if isinstance(value, str) and trusted_roblox_location(value):
                 return value
@@ -1335,7 +1464,12 @@ def find_download_location(payload: Any) -> Optional[str]:
 
 
 def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
-    head = raw[:512].lstrip()
+    if not raw:
+        raise RuntimeError("Roblox returned an empty file")
+    head = raw[:1024]
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:]
+    head = head.lstrip()
     lower = head.lower()
     if head.startswith(b"<roblox!"):
         return ".rbxm", "application/octet-stream"
@@ -1348,144 +1482,184 @@ def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
     raise RuntimeError("The downloaded asset is not a recognized RBXM/RBXMX model")
 
 
-def roblox_payload_error(payload: Any) -> str:
-    if not isinstance(payload, (dict, list)):
+def response_error_text(response: requests.Response) -> str:
+    try:
+        return response.text[:500].strip()
+    except Exception:
         return ""
-    if isinstance(payload, dict):
-        errors = payload.get("errors")
-        if isinstance(errors, list):
-            messages = []
-            for item in errors:
-                if isinstance(item, dict):
-                    message = item.get("message") or item.get("userFacingMessage") or item.get("code")
-                    if message is not None:
-                        messages.append(str(message))
-                elif item is not None:
-                    messages.append(str(item))
-            if messages:
-                return "; ".join(messages)[:400]
-        for key in ("error", "message", "userFacingMessage", "statusMessage"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:400]
-        for value in payload.values():
-            found = roblox_payload_error(value)
-            if found:
-                return found
-    else:
-        for value in payload:
-            found = roblox_payload_error(value)
-            if found:
-                return found
-    return ""
 
 
-def fetch_roblox_asset_response(url: str, headers: Dict[str, str], max_hops: int = 4) -> bytes:
-    current_url = url
-    current_headers = dict(headers)
-
-    for _ in range(max_hops):
-        response = requests.get(
-            current_url,
-            headers=current_headers,
-            timeout=(7, ROBLOX_HTTP_TIMEOUT),
-            allow_redirects=False,
-            stream=True,
-        )
-
+def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> Tuple[bytes, str, str]:
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+        stream=True,
+    )
+    try:
         if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location", "").strip()
-            response.close()
-            if not location or not trusted_roblox_location(location):
-                raise RuntimeError("Roblox returned an unsafe or empty redirect")
-            current_url = location
-            current_headers = {
-                "Accept": "*/*",
-                "User-Agent": "NamelessTools/1.0",
-            }
-            continue
+            location = response.headers.get("Location", "")
+            if not trusted_roblox_location(location):
+                raise RuntimeError(f"{label} returned an unsafe redirect")
+            follow_headers = {"Accept": "application/octet-stream, application/xml, application/json", "User-Agent": "NamelessTools/1.0"}
+            if urlparse(location).hostname == "apis.roblox.com" and ROBLOX_OPEN_CLOUD_KEY:
+                follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+            return fetch_from_asset_endpoint(location, follow_headers, label + " redirect")
 
-        raw = read_limited_response(response)
+        if response.status_code in (401, 403) and "apis.roblox.com" in url:
+            raise PermissionError(
+                "The Open Cloud key can search but cannot download assets. "
+                "Add Asset Delivery access (legacy-asset:manage) to ROBLOX_OPEN_CLOUD_KEY, then redeploy."
+            )
+        if response.status_code >= 400:
+            detail = response_error_text(response)
+            raise RuntimeError(f"{label} returned HTTP {response.status_code}: {detail or 'request failed'}")
+
         content_type = response.headers.get("Content-Type", "").lower()
-        status_code = response.status_code
+        raw = read_limited_response(response)
+    finally:
         response.close()
 
-        is_json = "json" in content_type or raw.lstrip()[:1] in (b"{", b"[")
-        if is_json:
-            try:
-                payload = json.loads(raw.decode("utf-8", errors="replace"))
-            except Exception:
-                payload = None
+    if "json" in content_type or raw[:1] in (b"{", b"["):
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise RuntimeError(f"{label} returned invalid JSON") from exc
+        location = find_download_location(payload)
+        if not location:
+            message = ""
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or payload.get("error") or "")
+            raise RuntimeError(message or f"{label} did not provide a download location")
+        follow_headers = {"Accept": "application/octet-stream, application/xml", "User-Agent": "NamelessTools/1.0"}
+        if urlparse(location).hostname == "apis.roblox.com" and ROBLOX_OPEN_CLOUD_KEY:
+            follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+        return fetch_from_asset_endpoint(location, follow_headers, label + " CDN")
 
-            location = find_download_location(payload)
-            if location:
-                current_url = location
-                current_headers = {
-                    "Accept": "*/*",
-                    "User-Agent": "NamelessTools/1.0",
-                }
-                continue
-
-            detail = roblox_payload_error(payload)
-            if status_code >= 400:
-                raise RuntimeError(f"HTTP {status_code}: {detail or 'request failed'}")
-            raise RuntimeError(detail or "Roblox returned JSON without a model download URL")
-
-        if status_code >= 400:
-            detail = raw[:300].decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"HTTP {status_code}: {detail or 'request failed'}")
-
-        return raw
-
-    raise RuntimeError("Too many Roblox download redirects")
+    extension, mime = classify_model_bytes(raw)
+    return raw, extension, mime
 
 
 def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
-    public_headers = {
-        "Accept": "*/*",
-        "User-Agent": "NamelessTools/1.0",
-    }
-    candidates = [
-        (
-            f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}",
-            public_headers,
-            "legacy v1 asset query",
-        ),
-        (
-            f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
-            public_headers,
-            "asset delivery v2",
-        ),
-        (
-            f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
-            public_headers,
-            "legacy v1 assetId",
-        ),
-    ]
+    # Restored from the early working downloader: never stop after an
+    # Open Cloud 401/403. Try every Asset Delivery variant in sequence.
+    candidates: List[Tuple[str, Dict[str, str], str]] = []
 
     if ROBLOX_OPEN_CLOUD_KEY:
         candidates.append((
             f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
             {
-                "Accept": "*/*",
-                "User-Agent": "NamelessTools/1.0",
+                "Accept": "application/octet-stream, application/xml, application/json",
                 "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+                "User-Agent": "NamelessTools/1.0",
             },
-            "Open Cloud asset delivery",
+            "Open Cloud Asset Delivery",
         ))
 
-    errors = []
+    candidates.extend([
+        (
+            f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox Asset Delivery v2",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox Asset Delivery v1 assetId",
+        ),
+        (
+            f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}",
+            {
+                "Accept": "application/octet-stream, application/xml, application/json",
+                "User-Agent": "NamelessTools/1.0",
+            },
+            "Roblox legacy Asset Delivery",
+        ),
+    ])
+
+    errors: List[str] = []
     for url, headers, label in candidates:
         try:
-            raw = fetch_roblox_asset_response(url, headers)
-            extension, mime = classify_model_bytes(raw)
-            return raw, extension, mime
-        except Exception as e:
-            errors.append(f"{label}: {e}")
+            return fetch_from_asset_endpoint(url, headers, label)
+        except Exception as exc:
+            # This is the important early-version behavior: continue to the
+            # next endpoint instead of forcing legacy-asset:manage.
+            errors.append(str(exc))
+            continue
 
-    if not errors:
-        raise RuntimeError("Roblox did not return the model")
-    raise RuntimeError(" | ".join(errors[-4:]))
+    if errors:
+        # Keep all endpoint results visible so it is clear which one failed.
+        unique: List[str] = []
+        for error in errors:
+            if error and error not in unique:
+                unique.append(error)
+        raise RuntimeError(" | ".join(unique[-4:]))
+    raise RuntimeError("Roblox did not return the model")
+
+def cleanup_model_downloads() -> None:
+    cutoff = time.time() - MODEL_DOWNLOAD_TTL
+    try:
+        for name in os.listdir(MODEL_DOWNLOAD_DIR):
+            path = os.path.join(MODEL_DOWNLOAD_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def clean_model_name(value: str, asset_id: int) -> str:
+    name = re.sub(r"[^A-Za-z0-9 _().\-]+", "", str(value or "")).strip()
+    name = re.sub(r"\s+", " ", name)[:80]
+    return name or f"roblox_model_{asset_id}"
+
+
+def create_download_token(raw: bytes, filename: str, mime: str) -> str:
+    cleanup_model_downloads()
+    token = secrets.token_urlsafe(32)
+    data_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".bin")
+    meta_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".json")
+    atomic_write(data_path, raw)
+    atomic_write_json(meta_path, {
+        "filename": filename,
+        "mime": mime,
+        "created_at": int(time.time()),
+        "size": len(raw),
+    })
+    return token
+
+
+def consume_download_token(token: str) -> Tuple[bytes, str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token or ""):
+        raise RuntimeError("Bad download token")
+    cleanup_model_downloads()
+    data_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".bin")
+    meta_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".json")
+    if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        raise RuntimeError("Download link expired")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if int(meta.get("created_at", 0)) < int(time.time()) - MODEL_DOWNLOAD_TTL:
+        raise RuntimeError("Download link expired")
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    filename = str(meta.get("filename") or "roblox_model.rbxm")
+    mime = str(meta.get("mime") or "application/octet-stream")
+    for path in (data_path, meta_path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return raw, filename, mime
 
 def safe_download_name(asset_id: int, extension: str) -> str:
     return f"roblox_model_{asset_id}{extension}"
@@ -1493,9 +1667,13 @@ def safe_download_name(asset_id: int, extension: str) -> str:
 
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
-    if not admin_authorized():
+    supplied = admin_key_from_request()
+    if not supplied or not hmac.compare_digest(supplied, ADMIN_KEY):
         time.sleep(0.15)
         return json_error("Bad admin key", 403)
+    session.clear()
+    session["admin_authorized"] = True
+    session["admin_login_at"] = int(time.time())
     return jsonify({
         "ok": True,
         "version": APP_VERSION,
@@ -1512,6 +1690,9 @@ def admin_models_search():
     if len(query) < 2:
         return json_error("Enter at least 2 characters", 400)
     limit = read_int_arg(request.args, "limit", 24, 1, 30)
+    page_token = request.args.get("page_token", "").strip()
+    if len(page_token) > 4096:
+        return json_error("Bad page token", 400)
     if not ROBLOX_OPEN_CLOUD_KEY:
         return json_error(
             "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY in Render Environment.",
@@ -1519,10 +1700,71 @@ def admin_models_search():
             {"setup_required": True},
         )
     try:
-        models = search_creator_store_models(query, limit)
+        result = search_creator_store_models(query, limit, page_token)
     except Exception as e:
         return json_error("Roblox search failed: " + str(e), 502)
-    return jsonify({"ok": True, "query": query, "models": models, "count": len(models), "version": APP_VERSION})
+    models = result.get("models", [])
+    response = jsonify({
+        "ok": True,
+        "query": query,
+        "models": models,
+        "count": len(models),
+        "filtered_count": int(result.get("filtered_count", 0)),
+        "next_page_token": str(result.get("next_page_token", "")),
+        "has_next_page": bool(result.get("next_page_token")),
+        "version": APP_VERSION,
+        "upstream_query_parameter": "query",
+        "upstream_page_parameter": "pageToken",
+    })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.route("/admin/models/prepare-download/<asset_id>", methods=["POST"])
+def admin_models_prepare_download(asset_id: str):
+    denied = require_admin_response()
+    if denied:
+        return denied
+    if not asset_id.isdigit():
+        return json_error("Bad asset ID", 400)
+    numeric_id = int(asset_id)
+    if numeric_id <= 0:
+        return json_error("Bad asset ID", 400)
+    body = request.get_json(silent=True)
+    requested_name = body.get("name", "") if isinstance(body, dict) else ""
+    try:
+        raw, extension, mime = fetch_model_file(numeric_id)
+    except Exception as e:
+        return json_error("Roblox download failed: " + str(e), 502)
+    base_name = clean_model_name(requested_name, numeric_id)
+    filename = base_name + extension
+    token = create_download_token(raw, filename, mime)
+    return jsonify({
+        "ok": True,
+        "filename": filename,
+        "size": len(raw),
+        "download_url": f"/admin/models/file/{token}",
+        "asset_id": numeric_id,
+        "version": APP_VERSION,
+    })
+
+
+@app.route("/admin/models/file/<token>", methods=["GET"])
+def admin_models_file(token: str):
+    denied = require_admin_response()
+    if denied:
+        return denied
+    try:
+        raw, filename, mime = consume_download_token(token)
+    except Exception as e:
+        return json_error(str(e), 404)
+    response = Response(raw, status=200, mimetype=mime)
+    safe_header_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    response.headers["Content-Disposition"] = f'attachment; filename="{safe_header_name}"'
+    response.headers["Content-Length"] = str(len(raw))
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.route("/admin/models/download/<asset_id>", methods=["GET"])
@@ -1555,7 +1797,14 @@ def version():
         "version": APP_VERSION,
         "search_endpoint": "/toolbox-service/v2/assets:search",
         "search_method": "GET",
-        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&keyword=castle",
+        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
+        "pagination": "nextPageToken -> pageToken",
+        "image_only_filter": True,
+        "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
+        "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
+        "download_notice": "rename the downloaded file and add .rbxm",
+        "download_uses_server_proxy": False,
+        "asset_id_priority": "assetId before id",
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
