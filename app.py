@@ -4,7 +4,7 @@ import os
 import re
 import time
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v7-2026-07-11"
+APP_VERSION = "model-search-v8-get-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -1224,23 +1224,56 @@ def search_creator_store_models(query: str, limit: int) -> List[Dict[str, Any]]:
             "Creator Store search is not configured. Set ROBLOX_OPEN_CLOUD_KEY in Render Environment."
         )
 
-    endpoint = "https://apis.roblox.com/toolbox-service/v2/assets:search"
     page_size = max(1, min(100, int(limit)))
-    params = {
-        "searchCategoryType": "Model",
-        "maxPageSize": page_size,
-    }
-    body = {
-        "query": query,
-    }
-    payload = roblox_json_request(
-        "POST",
-        endpoint,
-        require_open_cloud=True,
-        headers={"Content-Type": "application/json"},
-        params=params,
-        json=body,
+    encoded_query = quote_plus(query)
+    endpoint = (
+        "https://apis.roblox.com/toolbox-service/v2/assets:search"
+        f"?searchCategoryType=Model&maxPageSize={page_size}&keyword={encoded_query}"
     )
+    response = requests.get(
+        endpoint,
+        headers={
+            "Accept": "application/json",
+            "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+            "User-Agent": "NamelessTools/1.0",
+        },
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+    )
+
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("Location", "")
+        if not location.startswith("https://apis.roblox.com/"):
+            raise RuntimeError("Roblox returned an unsafe redirect")
+        response = requests.get(
+            location,
+            headers={
+                "Accept": "application/json",
+                "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+                "User-Agent": "NamelessTools/1.0",
+            },
+            timeout=(7, ROBLOX_HTTP_TIMEOUT),
+            allow_redirects=False,
+        )
+
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            "Open Cloud key was rejected. Check the key and its Creator Store permissions."
+        )
+    if response.status_code >= 400:
+        message = response.text[:500].strip()
+        raise RuntimeError(
+            f"Roblox returned HTTP {response.status_code}: {message or 'request failed'} "
+            f"[build={APP_VERSION}; method=GET; category=Model]"
+        )
+
+    try:
+        payload = response.json()
+    except Exception as e:
+        raise RuntimeError("Roblox returned invalid JSON") from e
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected Roblox response")
+
     models = normalize_model_items(payload, limit)
     thumbs = fetch_model_thumbnails([item["id"] for item in models])
     for item in models:
@@ -1438,6 +1471,8 @@ def version():
         "ok": True,
         "version": APP_VERSION,
         "search_endpoint": "/toolbox-service/v2/assets:search",
+        "search_method": "GET",
+        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&keyword=castle",
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
