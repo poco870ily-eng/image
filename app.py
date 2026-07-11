@@ -1,7 +1,9 @@
 import hmac
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 import traceback
 from urllib.parse import quote_plus, urlparse
@@ -9,14 +11,16 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, session
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v10-pages-3d-filter-2026-07-11"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+APP_VERSION = "model-search-v11-download-fix-2026-07-11"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
@@ -27,6 +31,8 @@ DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
 ORIGINAL_DIR = os.environ.get("ORIGINAL_DIR", "image_originals")
 VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
 IMAGE_SETTINGS_DIR = os.environ.get("IMAGE_SETTINGS_DIR", "image_settings")
+MODEL_DOWNLOAD_DIR = os.environ.get("MODEL_DOWNLOAD_DIR", "model_downloads")
+MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", "300"))))
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -38,7 +44,7 @@ VIDEO_MAX_CHUNK_FRAMES = int(os.environ.get("VIDEO_MAX_CHUNK_FRAMES", "12"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 
-for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR):
+for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR, MODEL_DOWNLOAD_DIR):
     os.makedirs(path, exist_ok=True)
 
 HTML = r'''
@@ -227,7 +233,7 @@ HTML = r'''
                     <div id="modelPageLabel" class="model-page-label">Page 1</div>
                     <button id="modelNextBtn" type="button" class="secondary">Next</button>
                 </div>
-                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets.</div>
+                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Roblox can refuse private, paid, deleted, moderated, or permission-restricted assets. Downloading also requires Asset Delivery permission on the Open Cloud key.</div>
             </div>
         </div>
     </div>
@@ -454,30 +460,18 @@ function responseFilename(res, fallback) {
 async function downloadModel(model, button) {
     const oldText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Downloading...';
+    button.textContent = 'Preparing...';
     try {
-        const res = await fetch('/admin/models/download/' + encodeURIComponent(model.id), {
-            headers: adminHeaders()
+        const res = await fetch('/admin/models/prepare-download/' + encodeURIComponent(model.id), {
+            method: 'POST',
+            headers: adminHeaders({ 'Content-Type': 'application/json', 'Accept': 'application/json' }),
+            body: JSON.stringify({ name: safeText(model.name || '') })
         });
-        if (!res.ok) {
-            let message = 'Download failed';
-            try {
-                const data = await parseJson(res);
-                message = data.error || message;
-            } catch (e) {}
-            throw new Error(message);
-        }
-        const blob = await res.blob();
-        const filename = responseFilename(res, 'model_' + model.id + '.rbxm');
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1500);
-        $('modelStatus').textContent = 'Downloaded: ' + filename;
+        const data = await parseJson(res);
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Download failed');
+        if (!data.download_url) throw new Error('Server did not create a download link');
+        $('modelStatus').textContent = 'Download started: ' + safeText(data.filename || ('model_' + model.id + '.rbxm'));
+        window.location.assign(data.download_url);
     } catch (e) {
         $('modelStatus').textContent = 'Download error: ' + (e && e.message ? e.message : e);
     } finally {
@@ -1114,6 +1108,8 @@ def admin_key_from_request() -> str:
 
 
 def admin_authorized() -> bool:
+    if session.get("admin_authorized") is True:
+        return True
     supplied = admin_key_from_request()
     return bool(supplied) and hmac.compare_digest(supplied, ADMIN_KEY)
 
@@ -1281,9 +1277,13 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dic
         if model_is_image_only(item, asset):
             filtered_count += 1
             continue
-        asset_id = first_nonempty(asset, ("id", "assetId", "assetID", "asset_id"))
+        asset_id = first_nonempty(asset, ("assetId", "assetID", "asset_id"))
         if asset_id is None:
-            asset_id = first_nonempty(item, ("id", "assetId", "assetID", "asset_id"))
+            asset_id = first_nonempty(item, ("assetId", "assetID", "asset_id"))
+        if asset_id is None:
+            asset_id = first_nonempty(asset, ("id",))
+        if asset_id is None:
+            asset_id = first_nonempty(item, ("id",))
         try:
             asset_id = int(asset_id)
         except Exception:
@@ -1450,7 +1450,7 @@ def trusted_roblox_location(url: str) -> bool:
 
 def find_download_location(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
-        for key in ("location", "url", "downloadUrl", "downloadURL"):
+        for key in ("location", "url", "downloadUrl", "downloadURL", "signedUrl", "signedURL"):
             value = payload.get(key)
             if isinstance(value, str) and trusted_roblox_location(value):
                 return value
@@ -1467,7 +1467,12 @@ def find_download_location(payload: Any) -> Optional[str]:
 
 
 def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
-    head = raw[:256].lstrip()
+    if not raw:
+        raise RuntimeError("Roblox returned an empty file")
+    head = raw[:1024]
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:]
+    head = head.lstrip()
     lower = head.lower()
     if head.startswith(b"<roblox!"):
         return ".rbxm", "application/octet-stream"
@@ -1480,61 +1485,157 @@ def classify_model_bytes(raw: bytes) -> Tuple[str, str]:
     raise RuntimeError("The downloaded asset is not a recognized RBXM/RBXMX model")
 
 
-def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
-    candidates = []
-    if ROBLOX_OPEN_CLOUD_KEY:
-        candidates.append((
-            f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
-            roblox_headers(),
-        ))
-    candidates.extend([
-        (f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
-        (f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}", {"User-Agent": "NamelessTools/1.0"}),
-    ])
-    errors = []
-    for url, headers in candidates:
-        try:
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=(7, ROBLOX_HTTP_TIMEOUT),
-                allow_redirects=True,
-                stream=True,
+def response_error_text(response: requests.Response) -> str:
+    try:
+        return response.text[:500].strip()
+    except Exception:
+        return ""
+
+
+def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> Tuple[bytes, str, str]:
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+        stream=True,
+    )
+    try:
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "")
+            if not trusted_roblox_location(location):
+                raise RuntimeError(f"{label} returned an unsafe redirect")
+            follow_headers = {"Accept": "application/octet-stream, application/xml, application/json", "User-Agent": "NamelessTools/1.0"}
+            if urlparse(location).hostname == "apis.roblox.com" and ROBLOX_OPEN_CLOUD_KEY:
+                follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+            return fetch_from_asset_endpoint(location, follow_headers, label + " redirect")
+
+        if response.status_code in (401, 403) and "apis.roblox.com" in url:
+            raise PermissionError(
+                "The Open Cloud key can search but cannot download assets. "
+                "Add Asset Delivery access (legacy-asset:manage) to ROBLOX_OPEN_CLOUD_KEY, then redeploy."
             )
-            if response.status_code >= 400:
-                errors.append(f"HTTP {response.status_code}")
-                response.close()
-                continue
-            content_type = response.headers.get("Content-Type", "").lower()
-            raw = read_limited_response(response)
-            response.close()
-            if "json" in content_type or raw[:1] in (b"{", b"["):
-                try:
-                    payload = json.loads(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    payload = None
-                location = find_download_location(payload)
-                if location:
-                    follow = requests.get(
-                        location,
-                        headers={"User-Agent": "NamelessTools/1.0"},
-                        timeout=(7, ROBLOX_HTTP_TIMEOUT),
-                        allow_redirects=True,
-                        stream=True,
-                    )
-                    if follow.status_code >= 400:
-                        errors.append(f"CDN HTTP {follow.status_code}")
-                        follow.close()
-                        continue
-                    raw = read_limited_response(follow)
-                    follow.close()
-            extension, mime = classify_model_bytes(raw)
-            return raw, extension, mime
-        except Exception as e:
-            errors.append(str(e))
+        if response.status_code >= 400:
+            detail = response_error_text(response)
+            raise RuntimeError(f"{label} returned HTTP {response.status_code}: {detail or 'request failed'}")
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        raw = read_limited_response(response)
+    finally:
+        response.close()
+
+    if "json" in content_type or raw[:1] in (b"{", b"["):
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise RuntimeError(f"{label} returned invalid JSON") from exc
+        location = find_download_location(payload)
+        if not location:
+            message = ""
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or payload.get("error") or "")
+            raise RuntimeError(message or f"{label} did not provide a download location")
+        follow_headers = {"Accept": "application/octet-stream, application/xml", "User-Agent": "NamelessTools/1.0"}
+        if urlparse(location).hostname == "apis.roblox.com" and ROBLOX_OPEN_CLOUD_KEY:
+            follow_headers["x-api-key"] = ROBLOX_OPEN_CLOUD_KEY
+        return fetch_from_asset_endpoint(location, follow_headers, label + " CDN")
+
+    extension, mime = classify_model_bytes(raw)
+    return raw, extension, mime
+
+
+def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
+    errors: List[str] = []
+    if ROBLOX_OPEN_CLOUD_KEY:
+        try:
+            return fetch_from_asset_endpoint(
+                f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
+                {
+                    "Accept": "application/octet-stream, application/xml, application/json",
+                    "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+                    "User-Agent": "NamelessTools/1.0",
+                },
+                "Open Cloud Asset Delivery",
+            )
+        except PermissionError:
+            raise
+        except Exception as exc:
+            errors.append(str(exc))
+
+    for url in (
+        f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}",
+        f"https://assetdelivery.roblox.com/v1/assetId/{asset_id}",
+    ):
+        try:
+            return fetch_from_asset_endpoint(
+                url,
+                {"Accept": "application/octet-stream, application/xml, application/json", "User-Agent": "NamelessTools/1.0"},
+                "Roblox Asset Delivery",
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+
     message = errors[-1] if errors else "Roblox did not return the model"
     raise RuntimeError(message)
 
+
+def cleanup_model_downloads() -> None:
+    cutoff = time.time() - MODEL_DOWNLOAD_TTL
+    try:
+        for name in os.listdir(MODEL_DOWNLOAD_DIR):
+            path = os.path.join(MODEL_DOWNLOAD_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def clean_model_name(value: str, asset_id: int) -> str:
+    name = re.sub(r"[^A-Za-z0-9 _().\-]+", "", str(value or "")).strip()
+    name = re.sub(r"\s+", " ", name)[:80]
+    return name or f"roblox_model_{asset_id}"
+
+
+def create_download_token(raw: bytes, filename: str, mime: str) -> str:
+    cleanup_model_downloads()
+    token = secrets.token_urlsafe(32)
+    data_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".bin")
+    meta_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".json")
+    atomic_write(data_path, raw)
+    atomic_write_json(meta_path, {
+        "filename": filename,
+        "mime": mime,
+        "created_at": int(time.time()),
+        "size": len(raw),
+    })
+    return token
+
+
+def consume_download_token(token: str) -> Tuple[bytes, str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token or ""):
+        raise RuntimeError("Bad download token")
+    cleanup_model_downloads()
+    data_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".bin")
+    meta_path = os.path.join(MODEL_DOWNLOAD_DIR, token + ".json")
+    if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        raise RuntimeError("Download link expired")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if int(meta.get("created_at", 0)) < int(time.time()) - MODEL_DOWNLOAD_TTL:
+        raise RuntimeError("Download link expired")
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    filename = str(meta.get("filename") or "roblox_model.rbxm")
+    mime = str(meta.get("mime") or "application/octet-stream")
+    for path in (data_path, meta_path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return raw, filename, mime
 
 def safe_download_name(asset_id: int, extension: str) -> str:
     return f"roblox_model_{asset_id}{extension}"
@@ -1542,9 +1643,13 @@ def safe_download_name(asset_id: int, extension: str) -> str:
 
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
-    if not admin_authorized():
+    supplied = admin_key_from_request()
+    if not supplied or not hmac.compare_digest(supplied, ADMIN_KEY):
         time.sleep(0.15)
         return json_error("Bad admin key", 403)
+    session.clear()
+    session["admin_authorized"] = True
+    session["admin_login_at"] = int(time.time())
     return jsonify({
         "ok": True,
         "version": APP_VERSION,
@@ -1591,6 +1696,55 @@ def admin_models_search():
     return response
 
 
+@app.route("/admin/models/prepare-download/<asset_id>", methods=["POST"])
+def admin_models_prepare_download(asset_id: str):
+    denied = require_admin_response()
+    if denied:
+        return denied
+    if not asset_id.isdigit():
+        return json_error("Bad asset ID", 400)
+    numeric_id = int(asset_id)
+    if numeric_id <= 0:
+        return json_error("Bad asset ID", 400)
+    body = request.get_json(silent=True)
+    requested_name = body.get("name", "") if isinstance(body, dict) else ""
+    try:
+        raw, extension, mime = fetch_model_file(numeric_id)
+    except PermissionError as e:
+        return json_error(str(e), 403, {"asset_delivery_permission_required": True})
+    except Exception as e:
+        return json_error("Roblox download failed: " + str(e), 502)
+    base_name = clean_model_name(requested_name, numeric_id)
+    filename = base_name + extension
+    token = create_download_token(raw, filename, mime)
+    return jsonify({
+        "ok": True,
+        "filename": filename,
+        "size": len(raw),
+        "download_url": f"/admin/models/file/{token}",
+        "asset_id": numeric_id,
+        "version": APP_VERSION,
+    })
+
+
+@app.route("/admin/models/file/<token>", methods=["GET"])
+def admin_models_file(token: str):
+    denied = require_admin_response()
+    if denied:
+        return denied
+    try:
+        raw, filename, mime = consume_download_token(token)
+    except Exception as e:
+        return json_error(str(e), 404)
+    response = Response(raw, status=200, mimetype=mime)
+    safe_header_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    response.headers["Content-Disposition"] = f'attachment; filename="{safe_header_name}"'
+    response.headers["Content-Length"] = str(len(raw))
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
 @app.route("/admin/models/download/<asset_id>", methods=["GET"])
 def admin_models_download(asset_id: str):
     denied = require_admin_response()
@@ -1603,6 +1757,8 @@ def admin_models_download(asset_id: str):
         return json_error("Bad asset ID", 400)
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
+    except PermissionError as e:
+        return json_error(str(e), 403, {"asset_delivery_permission_required": True})
     except Exception as e:
         return json_error("Roblox download failed: " + str(e), 502)
     filename = safe_download_name(numeric_id, extension)
@@ -1624,6 +1780,9 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
+        "download_flow": "prepare token -> direct browser attachment",
+        "asset_id_priority": "assetId before id",
+        "asset_delivery_permission": "legacy-asset:manage",
         "search_category_type": "Model",
         "model_asset_type": 10,
         "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
