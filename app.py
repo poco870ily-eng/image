@@ -21,12 +21,11 @@ Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v17-mesh-filter-2026-07-12"
+APP_VERSION = "model-search-v18-store-meshpart-count-2026-07-12"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
 ROBLOX_OPEN_CLOUD_KEY = os.environ.get("ROBLOX_OPEN_CLOUD_KEY", "").strip()
-ROBLOX_ASSET_DELIVERY_KEY = os.environ.get("ROBLOX_ASSET_DELIVERY_KEY", "").strip() or ROBLOX_OPEN_CLOUD_KEY
 ROBLOX_HTTP_TIMEOUT = max(5, min(60, int(os.environ.get("ROBLOX_HTTP_TIMEOUT", "25"))))
 ROBLOX_MAX_MODEL_BYTES = max(1_000_000, min(100_000_000, int(os.environ.get("ROBLOX_MAX_MODEL_BYTES", "50000000"))))
 DATA_DIR = os.environ.get("DATA_DIR", "image_ports")
@@ -36,7 +35,6 @@ IMAGE_SETTINGS_DIR = os.environ.get("IMAGE_SETTINGS_DIR", "image_settings")
 MODEL_DOWNLOAD_DIR = os.environ.get("MODEL_DOWNLOAD_DIR", "model_downloads")
 MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", "300"))))
 MESH_SCAN_CACHE_DIR = os.environ.get("MESH_SCAN_CACHE_DIR", "mesh_scan_cache")
-MESH_SCAN_TIMEOUT = max(4, min(20, int(os.environ.get("MESH_SCAN_TIMEOUT", "9"))))
 MESH_SCAN_EXACT_TTL = max(3600, min(2592000, int(os.environ.get("MESH_SCAN_EXACT_TTL", "604800"))))
 MESH_SCAN_UNKNOWN_TTL = max(60, min(86400, int(os.environ.get("MESH_SCAN_UNKNOWN_TTL", "900"))))
 
@@ -245,9 +243,9 @@ HTML = r'''
                 <div class="model-filter-row">
                     <label class="model-filter-check" for="onlyNoMesh">
                         <input id="onlyNoMesh" type="checkbox">
-                        <span>Only models without meshes</span>
+                        <span>Only models without MeshParts</span>
                     </label>
-                    <div id="meshSummary" class="mesh-summary">Mesh check starts after search.</div>
+                    <div id="meshSummary" class="mesh-summary">MeshPart count loads after search.</div>
                 </div>
                 <div id="modelStatus" class="status">Enter a model name.</div>
                 <div id="modelResults" class="model-grid"></div>
@@ -379,8 +377,8 @@ function cardElement(model) {
 
     const mesh = document.createElement('div');
     mesh.className = 'mesh-badge checking';
-    mesh.textContent = 'Checking meshes...';
-    mesh.title = 'The server is reading the model file and looking for MeshPart or SpecialMesh.';
+    mesh.textContent = 'Checking MeshParts...';
+    mesh.title = 'The server is requesting MeshPart Count from Roblox Creator Store details.';
     card.dataset.assetId = safeText(model.id);
     card.dataset.meshStatus = 'checking';
 
@@ -408,14 +406,14 @@ function updateMeshSummary() {
         if (!card.classList.contains('mesh-filter-hidden')) visible++;
     });
     if (!cards.length) {
-        $('meshSummary').textContent = 'Mesh check starts after search.';
+        $('meshSummary').textContent = 'MeshPart count loads after search.';
         return;
     }
     const bits = [];
-    if (noMesh) bits.push('without mesh: ' + noMesh);
-    if (hasMesh) bits.push('with mesh: ' + hasMesh);
+    if (noMesh) bits.push('without MeshParts: ' + noMesh);
+    if (hasMesh) bits.push('with MeshParts: ' + hasMesh);
     if (checking) bits.push('checking: ' + checking);
-    if (unknown) bits.push('unavailable: ' + unknown);
+    if (unknown) bits.push('count unavailable: ' + unknown);
     if ($('onlyNoMesh').checked) bits.push('shown: ' + visible);
     $('meshSummary').textContent = bits.join(' · ');
 }
@@ -427,24 +425,27 @@ function applyMeshFilter() {
     });
     updateMeshSummary();
 }
-function setCardMeshStatus(assetId, status, classes, reason) {
+function setCardMeshStatus(assetId, status, meshPartCount, reason) {
     const card = document.querySelector('#modelResults .model-card[data-asset-id="' + CSS.escape(String(assetId)) + '"]');
     if (!card) return;
     const badge = meshBadgeForCard(card);
+    const count = Number(meshPartCount);
+    const validCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
     card.dataset.meshStatus = status;
+    card.dataset.meshPartCount = validCount === null ? '' : String(validCount);
     badge.className = 'mesh-badge';
     if (status === 'has_mesh') {
         badge.classList.add('has-mesh');
-        badge.textContent = 'Has mesh';
-        badge.title = classes && classes.length ? ('Found: ' + classes.join(', ')) : 'MeshPart or SpecialMesh found.';
+        badge.textContent = validCount === null ? 'Has MeshPart' : ('Has mesh · ' + validCount + ' MeshPart' + (validCount === 1 ? '' : 's'));
+        badge.title = validCount === null ? 'Roblox reports one or more MeshParts.' : ('Roblox Store MeshPart Count: ' + validCount);
     } else if (status === 'no_mesh') {
         badge.classList.add('no-mesh');
-        badge.textContent = 'No mesh';
-        badge.title = 'The model file was checked: no MeshPart or SpecialMesh was found.';
+        badge.textContent = 'No MeshParts';
+        badge.title = 'Roblox Store MeshPart Count: 0';
     } else {
         badge.classList.add('unknown');
-        badge.textContent = 'Mesh check unavailable';
-        badge.title = reason || 'Roblox did not let the server read this model file.';
+        badge.textContent = 'MeshPart count unavailable';
+        badge.title = reason || 'Roblox did not return MeshPart Count for this model.';
     }
     applyMeshFilter();
 }
@@ -458,11 +459,16 @@ async function checkOneModelMesh(model, generation) {
         });
         const data = await parseJson(res);
         if (generation !== state.meshScanGeneration) return;
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Mesh check failed');
-        setCardMeshStatus(assetId, safeText(data.status || 'unknown'), Array.isArray(data.mesh_classes) ? data.mesh_classes : [], safeText(data.reason || ''));
+        if (!res.ok || !data.ok) throw new Error(data.error || 'MeshPart count request failed');
+        setCardMeshStatus(
+            assetId,
+            safeText(data.status || 'unknown'),
+            data.mesh_part_count,
+            safeText(data.reason || '')
+        );
     } catch (e) {
         if (generation !== state.meshScanGeneration) return;
-        setCardMeshStatus(assetId, 'unknown', [], e && e.message ? e.message : String(e));
+        setCardMeshStatus(assetId, 'unknown', null, e && e.message ? e.message : String(e));
     }
 }
 async function checkModelMeshes(models) {
@@ -1731,6 +1737,7 @@ def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
 
 
 
+
 def mesh_cache_file(asset_id: int) -> str:
     return os.path.join(MESH_SCAN_CACHE_DIR, f"{int(asset_id)}.json")
 
@@ -1744,7 +1751,16 @@ def load_mesh_scan_cache(asset_id: int) -> Optional[Dict[str, Any]]:
             data = json.load(f)
         if not isinstance(data, dict):
             return None
+        # Ignore caches created by the older RBXM scanner.
+        if data.get("source") != "creator_store_asset_details":
+            return None
+        count = data.get("mesh_part_count")
         status = str(data.get("status", "unknown"))
+        if status in ("has_mesh", "no_mesh"):
+            if not isinstance(count, int) or count < 0:
+                return None
+        elif status != "unknown":
+            return None
         created_at = int(data.get("checked_at", 0))
         ttl = MESH_SCAN_EXACT_TTL if status in ("has_mesh", "no_mesh") else MESH_SCAN_UNKNOWN_TTL
         if created_at < int(time.time()) - ttl:
@@ -1762,188 +1778,84 @@ def save_mesh_scan_cache(asset_id: int, result: Dict[str, Any]) -> Dict[str, Any
     return payload
 
 
-def lz4_decompress_block(data: bytes, expected_size: int) -> bytes:
-    src = memoryview(data)
-    out = bytearray()
-    i = 0
-    while i < len(src):
-        token = int(src[i])
-        i += 1
-        literal_len = token >> 4
-        if literal_len == 15:
-            while True:
-                if i >= len(src):
-                    raise ValueError("Truncated LZ4 literal length")
-                value = int(src[i])
-                i += 1
-                literal_len += value
-                if value != 255:
-                    break
-        if i + literal_len > len(src):
-            raise ValueError("Truncated LZ4 literals")
-        out.extend(src[i:i + literal_len])
-        i += literal_len
-        if i >= len(src):
-            break
-        if i + 2 > len(src):
-            raise ValueError("Truncated LZ4 match offset")
-        offset = int(src[i]) | (int(src[i + 1]) << 8)
-        i += 2
-        if offset <= 0 or offset > len(out):
-            raise ValueError("Invalid LZ4 match offset")
-        match_len = token & 0x0F
-        if match_len == 15:
-            while True:
-                if i >= len(src):
-                    raise ValueError("Truncated LZ4 match length")
-                value = int(src[i])
-                i += 1
-                match_len += value
-                if value != 255:
-                    break
-        match_len += 4
-        start = len(out) - offset
-        for _ in range(match_len):
-            out.append(out[start])
-            start += 1
-        if expected_size and len(out) > expected_size:
-            raise ValueError("LZ4 output is larger than expected")
-    if expected_size and len(out) != expected_size:
-        raise ValueError("LZ4 output size mismatch")
-    return bytes(out)
+def normalize_json_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def inspect_model_mesh_classes(raw: bytes) -> Dict[str, Any]:
-    mesh_classes: List[str] = []
-    if not raw:
-        return {"status": "unknown", "mesh_classes": [], "reason": "Empty model file"}
-
-    trimmed = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
-    stripped = trimmed.lstrip()
-    lower = stripped[:128].lower()
-
-    if not raw.startswith(b"<roblox!"):
-        if lower.startswith(b"<?xml") or lower.startswith(b"<roblox"):
-            text = stripped.decode("utf-8", errors="replace")
-            for class_name in ("MeshPart", "SpecialMesh"):
-                if re.search(r'<Item\s+class=["\']' + re.escape(class_name) + r'["\']', text, re.IGNORECASE):
-                    mesh_classes.append(class_name)
-            return {
-                "status": "has_mesh" if mesh_classes else "no_mesh",
-                "mesh_classes": mesh_classes,
-                "format": "rbxmx",
-                "reason": "",
-            }
-        return {"status": "unknown", "mesh_classes": [], "reason": "Unrecognized model format"}
-
-    # Binary RBXM header is 32 bytes. Each chunk has a 16-byte header:
-    # name, compressed length, uncompressed length, reserved.
-    pos = 32
-    saw_chunk = False
-    saw_end = False
-    try:
-        while pos + 16 <= len(raw):
-            chunk_name = raw[pos:pos + 4]
-            compressed_len, uncompressed_len, _reserved = struct.unpack_from("<III", raw, pos + 4)
-            pos += 16
-            stored_len = compressed_len if compressed_len else uncompressed_len
-            if stored_len < 0 or pos + stored_len > len(raw):
-                raise ValueError("Invalid RBXM chunk size")
-            payload = raw[pos:pos + stored_len]
-            pos += stored_len
-            saw_chunk = True
-            if compressed_len:
-                payload = lz4_decompress_block(payload, uncompressed_len)
-            if chunk_name.startswith(b"INST"):
-                if b"MeshPart" in payload and "MeshPart" not in mesh_classes:
-                    mesh_classes.append("MeshPart")
-                if b"SpecialMesh" in payload and "SpecialMesh" not in mesh_classes:
-                    mesh_classes.append("SpecialMesh")
-            if chunk_name.startswith(b"END"):
-                saw_end = True
-                break
-        if not saw_chunk or not saw_end:
-            raise ValueError("Incomplete RBXM chunk stream")
-    except Exception as exc:
-        return {
-            "status": "unknown",
-            "mesh_classes": mesh_classes,
-            "format": "rbxm",
-            "reason": "Could not fully parse RBXM: " + str(exc),
-        }
-
-    return {
-        "status": "has_mesh" if mesh_classes else "no_mesh",
-        "mesh_classes": mesh_classes,
-        "format": "rbxm",
-        "reason": "",
+def find_mesh_part_count(payload: Any) -> Optional[int]:
+    """Find Roblox Store's MeshPart Count even if the response nests it."""
+    wanted = {
+        "meshpartcount",
+        "meshpartscount",
+        "numberofmeshparts",
+        "meshparts",
     }
+    if isinstance(payload, dict):
+        # Prefer exact keys at the current level before walking nested objects.
+        for key, value in payload.items():
+            if normalize_json_key(key) in wanted:
+                if isinstance(value, bool):
+                    continue
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if count >= 0:
+                    return count
+        for value in payload.values():
+            found = find_mesh_part_count(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = find_mesh_part_count(value)
+            if found is not None:
+                return found
+    return None
 
 
-def fetch_mesh_scan_model(asset_id: int) -> bytes:
-    candidates: List[Tuple[str, Dict[str, str], str]] = []
-    if ROBLOX_ASSET_DELIVERY_KEY:
-        candidates.append((
-            f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
-            {
-                "Accept": "application/octet-stream, application/xml, application/json",
-                "x-api-key": ROBLOX_ASSET_DELIVERY_KEY,
-                "User-Agent": "NamelessTools/1.0",
-            },
-            "Open Cloud Asset Delivery",
-        ))
-    candidates.append((
-        f"https://assetdelivery.roblox.com/v1/asset?id={asset_id}",
-        {
-            "Accept": "application/octet-stream, application/xml, application/json",
+def fetch_creator_store_asset_details(asset_id: int) -> Dict[str, Any]:
+    if not ROBLOX_OPEN_CLOUD_KEY:
+        raise RuntimeError("ROBLOX_OPEN_CLOUD_KEY is not configured")
+    endpoint = f"https://apis.roblox.com/toolbox-service/v2/assets/{int(asset_id)}"
+    response = requests.get(
+        endpoint,
+        headers={
+            "Accept": "application/json",
+            "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
             "User-Agent": "NamelessTools/1.0",
         },
-        "Roblox Asset Delivery",
-    ))
-
-    errors: List[str] = []
-    for url, headers, label in candidates:
-        response = None
-        try:
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=(4, MESH_SCAN_TIMEOUT),
-                allow_redirects=True,
-                stream=True,
-            )
-            if response.status_code >= 400:
-                errors.append(f"{label} HTTP {response.status_code}")
-                continue
-            content_type = response.headers.get("Content-Type", "").lower()
-            raw = read_limited_response(response)
-            if "json" in content_type or raw[:1] in (b"{", b"["):
-                try:
-                    payload = json.loads(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    errors.append(f"{label} returned invalid JSON")
-                    continue
-                location = find_download_location(payload)
-                if not location:
-                    errors.append(f"{label} did not return model content")
-                    continue
-                follow_headers = {"Accept": "application/octet-stream, application/xml", "User-Agent": "NamelessTools/1.0"}
-                follow = requests.get(location, headers=follow_headers, timeout=(4, MESH_SCAN_TIMEOUT), allow_redirects=True, stream=True)
-                try:
-                    if follow.status_code >= 400:
-                        errors.append(f"{label} CDN HTTP {follow.status_code}")
-                        continue
-                    raw = read_limited_response(follow)
-                finally:
-                    follow.close()
-            classify_model_bytes(raw)
-            return raw
-        except Exception as exc:
-            errors.append(str(exc))
-        finally:
-            if response is not None:
-                response.close()
-    raise RuntimeError("; ".join(dict.fromkeys(errors)) or "Roblox did not provide model content")
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+    )
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("Location", "")
+        if not location.startswith("https://apis.roblox.com/"):
+            raise RuntimeError("Roblox returned an unsafe redirect")
+        response = requests.get(
+            location,
+            headers={
+                "Accept": "application/json",
+                "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+                "User-Agent": "NamelessTools/1.0",
+            },
+            timeout=(7, ROBLOX_HTTP_TIMEOUT),
+            allow_redirects=False,
+        )
+    if response.status_code in (401, 403):
+        raise RuntimeError("Open Cloud key was rejected for Creator Store asset details")
+    if response.status_code == 404:
+        raise RuntimeError("Creator Store asset details were not found")
+    if response.status_code >= 400:
+        message = response.text[:400].strip()
+        raise RuntimeError(f"Roblox details HTTP {response.status_code}: {message or 'request failed'}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError("Roblox returned invalid asset details JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected Roblox asset details response")
+    return payload
 
 
 def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
@@ -1953,17 +1865,31 @@ def get_model_mesh_status(asset_id: int, force: bool = False) -> Dict[str, Any]:
             cached["cached"] = True
             return cached
     try:
-        raw = fetch_mesh_scan_model(asset_id)
-        result = inspect_model_mesh_classes(raw)
+        details = fetch_creator_store_asset_details(asset_id)
+        count = find_mesh_part_count(details)
+        if count is None:
+            result = {
+                "status": "unknown",
+                "mesh_part_count": None,
+                "reason": "Roblox asset details did not include MeshPart Count",
+                "source": "creator_store_asset_details",
+            }
+        else:
+            result = {
+                "status": "has_mesh" if count > 0 else "no_mesh",
+                "mesh_part_count": count,
+                "reason": "",
+                "source": "creator_store_asset_details",
+            }
     except Exception as exc:
         result = {
             "status": "unknown",
-            "mesh_classes": [],
-            "reason": "Roblox did not allow the server to inspect this model: " + str(exc),
+            "mesh_part_count": None,
+            "reason": str(exc),
+            "source": "creator_store_asset_details",
         }
     result["cached"] = False
     return save_mesh_scan_cache(asset_id, result)
-
 
 def cleanup_model_downloads() -> None:
     cutoff = time.time() - MODEL_DOWNLOAD_TTL
@@ -2095,9 +2021,9 @@ def admin_model_mesh_status(asset_id: str):
         "ok": True,
         "asset_id": int(asset_id),
         "status": str(result.get("status", "unknown")),
-        "mesh_classes": result.get("mesh_classes", []),
+        "mesh_part_count": result.get("mesh_part_count"),
         "reason": str(result.get("reason", "")),
-        "format": result.get("format"),
+        "source": str(result.get("source", "creator_store_asset_details")),
         "cached": bool(result.get("cached", False)),
         "checked_at": int(result.get("checked_at", int(time.time()))),
         "version": APP_VERSION,
@@ -2186,9 +2112,9 @@ def version():
         "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
         "pagination": "nextPageToken -> pageToken",
         "image_only_filter": True,
-        "mesh_detection": "RBXM/RBXMX content scan for MeshPart and SpecialMesh",
-        "mesh_filter": "only confirmed no_mesh models",
-        "mesh_asset_delivery_key_configured": bool(ROBLOX_ASSET_DELIVERY_KEY),
+        "mesh_detection": "Creator Store asset details MeshPart Count",
+        "mesh_filter": "only models with confirmed MeshPart Count = 0",
+        "mesh_details_endpoint": "/toolbox-service/v2/assets/{id}",
         "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
         "download_notice": "rename the downloaded file and add .rbxm",
