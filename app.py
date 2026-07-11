@@ -1,4 +1,3 @@
-# hello
 import hmac
 import json
 import os
