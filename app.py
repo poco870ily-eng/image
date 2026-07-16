@@ -1,34 +1,24 @@
-import hmac
-import html as html_lib
-import hashlib
 import json
 import os
 import re
 import secrets
-import struct
 import time
 import traceback
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from flask import Flask, Response, jsonify, render_template_string, request, session
+from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "").strip() or hashlib.sha256((os.environ.get("ADMIN_KEY", "admin123") + "|nameless-model-browser").encode("utf-8")).hexdigest()
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
-APP_VERSION = "model-search-v22-fast-batch-mesh-check-2026-07-12"
+APP_VERSION = "model-search-v23-clean-2026-07-16"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip() or "admin123"
 ROBLOX_OPEN_CLOUD_KEY = os.environ.get("ROBLOX_OPEN_CLOUD_KEY", "").strip()
 ROBLOX_HTTP_TIMEOUT = max(5, min(60, int(os.environ.get("ROBLOX_HTTP_TIMEOUT", "25"))))
 ROBLOX_MAX_MODEL_BYTES = max(1_000_000, min(100_000_000, int(os.environ.get("ROBLOX_MAX_MODEL_BYTES", "50000000"))))
@@ -38,15 +28,6 @@ VIDEO_DIR = os.environ.get("VIDEO_DIR", "video_ports")
 IMAGE_SETTINGS_DIR = os.environ.get("IMAGE_SETTINGS_DIR", "image_settings")
 MODEL_DOWNLOAD_DIR = os.environ.get("MODEL_DOWNLOAD_DIR", "model_downloads")
 MODEL_DOWNLOAD_TTL = max(60, min(1800, int(os.environ.get("MODEL_DOWNLOAD_TTL", "300"))))
-MESH_SCAN_CACHE_DIR = os.environ.get("MESH_SCAN_CACHE_DIR", "mesh_scan_cache")
-MESH_SCAN_EXACT_TTL = max(3600, min(2592000, int(os.environ.get("MESH_SCAN_EXACT_TTL", "604800"))))
-MESH_SCAN_UNKNOWN_TTL = max(60, min(86400, int(os.environ.get("MESH_SCAN_UNKNOWN_TTL", "900"))))
-MESH_DETAILS_SOURCE = "creator_store_fast_batch_v6"
-STORE_PAGE_MAX_BYTES = max(250000, min(4000000, int(os.environ.get("STORE_PAGE_MAX_BYTES", "1500000"))))
-MESH_CHECK_WORKERS = max(4, min(16, int(os.environ.get("MESH_CHECK_WORKERS", "10"))))
-MESH_FAST_CONNECT_TIMEOUT = max(2, min(10, int(os.environ.get("MESH_FAST_CONNECT_TIMEOUT", "4"))))
-MESH_FAST_READ_TIMEOUT = max(4, min(20, int(os.environ.get("MESH_FAST_READ_TIMEOUT", "10"))))
-_mesh_http_local = threading.local()
 
 DEFAULT_RES = int(os.environ.get("DEFAULT_RES", "96"))
 DEFAULT_VIDEO_RES = int(os.environ.get("DEFAULT_VIDEO_RES", "64"))
@@ -58,7 +39,7 @@ VIDEO_MAX_CHUNK_FRAMES = int(os.environ.get("VIDEO_MAX_CHUNK_FRAMES", "12"))
 MAX_RECTS = int(os.environ.get("MAX_RECTS", "12000"))
 ALPHA_LIMIT = int(os.environ.get("ALPHA_LIMIT", "35"))
 
-for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR, MODEL_DOWNLOAD_DIR, MESH_SCAN_CACHE_DIR):
+for path in (DATA_DIR, ORIGINAL_DIR, VIDEO_DIR, IMAGE_SETTINGS_DIR, MODEL_DOWNLOAD_DIR):
     os.makedirs(path, exist_ok=True)
 
 HTML = r'''
@@ -97,7 +78,6 @@ HTML = r'''
         .fill { height: 100%; width: 0%; background: linear-gradient(90deg, #1388ff, #1cb8ff); transition: width .12s linear; }
         .topline { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }
         @media (max-width: 720px) { .topline { grid-template-columns: 1fr; } }
-        .mini { margin-top: 8px; font-size: 12px; color: #a9a9b8; }
         .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 18px; padding: 5px; border-radius: 12px; background: #0e0e14; border: 1px solid #2b2c36; }
         .tab-btn { background: transparent; color: #a8a8b5; border: 1px solid transparent; }
         .tab-btn.active { background: #262833; color: #fff; border-color: #353744; }
@@ -112,29 +92,11 @@ HTML = r'''
         .model-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .model-meta { min-height: 34px; margin: 6px 0 10px; color: #9797a6; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
         .model-card button { padding: 10px; }
-        .model-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding: 11px 12px; border: 1px solid #30313c; border-radius: 11px; background: #101016; }
-        .model-filter-check { display: inline-flex; align-items: center; gap: 9px; margin: 0; color: #e6e6ec; cursor: pointer; }
-        .model-filter-check input { width: 17px; height: 17px; margin: 0; accent-color: #1388ff; }
-        .mesh-summary { font-size: 12px; color: #9999a8; text-align: right; }
-        .mesh-badge { min-height: 18px; margin: -2px 0 9px; font-size: 12px; font-weight: 800; line-height: 1.35; }
-        .mesh-badge.checking { color: #9b9baa; }
-        .mesh-badge.has-mesh { color: #ff5e67; }
-        .mesh-badge.no-mesh { color: #70e49c; }
-        .mesh-badge.unknown { color: #9b9baa; font-weight: 600; }
-        .model-card.mesh-filter-hidden { display: none; }
         .empty-models { grid-column: 1 / -1; padding: 28px 14px; text-align: center; color: #9797a6; border: 1px dashed #333441; border-radius: 14px; }
         .model-pagination { display: none; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; margin-top: 16px; }
         .model-pagination.visible { display: grid; }
         .model-pagination button { width: 100%; }
         .model-page-label { min-width: 86px; text-align: center; color: #b7b7c4; font-size: 13px; }
-        .admin-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
-        .admin-row button { width: auto; padding: 9px 12px; }
-        .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; align-items: center; justify-content: center; padding: 18px; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
-        .modal-backdrop.open { display: flex; }
-        .modal-card { width: min(410px, 100%); padding: 18px; border-radius: 16px; border: 1px solid #333441; background: #17171d; box-shadow: 0 24px 80px rgba(0,0,0,.55); }
-        .modal-card h2 { margin-bottom: 6px; }
-        .modal-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
-        .download-note { margin-top: 12px; font-size: 12px; line-height: 1.45; color: #9292a1; }
         @media (max-width: 720px) {
             .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .model-actions { grid-template-columns: 1fr; }
@@ -147,10 +109,9 @@ HTML = r'''
 <div class="wrap">
     <div class="box">
         <h1>Nameless Tools</h1>
-        <div class="mini">Build {{ app_version }}</div>
         <div class="tabs">
             <button id="painterTabBtn" class="tab-btn active" type="button">Image / Video</button>
-            <button id="modelsTabBtn" class="tab-btn" type="button">Model Browser</button>
+            <button id="modelsTabBtn" class="tab-btn" type="button">Models</button>
         </div>
 
         <div id="painterPanel" class="tab-panel active">
@@ -183,15 +144,13 @@ HTML = r'''
                 <div>
                     <label for="imgRes">Image resolution</label>
                     <input id="imgRes" type="number" min="8" max="{{ abs_max_res }}" value="96">
-                    <div class="hint">Bigger value = more detail and more blocks.</div>
                 </div>
                 <div>
                     <label for="imgStep">Image color step</label>
                     <input id="imgStep" type="number" min="4" max="64" value="16">
-                    <div class="hint">Smaller value = more accurate colors.</div>
                 </div>
             </div>
-            <div id="imgStatus" class="status">Choose an image, upload it once, then changing image settings updates it automatically.</div>
+            <div id="imgStatus" class="status">No image selected.</div>
         </div>
 
         <div class="section">
@@ -210,52 +169,34 @@ HTML = r'''
                 <div>
                     <label for="vidRes">Video resolution</label>
                     <input id="vidRes" type="number" min="16" max="{{ video_max_res }}" value="64">
-                    <div class="hint">Smaller value = smoother playback.</div>
                 </div>
                 <div>
                     <label for="vidFps">Video FPS</label>
                     <input id="vidFps" type="number" min="0.25" max="8" step="0.25" value="2">
-                    <div class="hint">How many frames are saved per second.</div>
                 </div>
                 <div>
                     <label for="vidFrames">Max frames</label>
                     <input id="vidFrames" type="number" min="1" max="{{ video_max_frames }}" value="60">
-                    <div class="hint">Total frames to keep from the video.</div>
                 </div>
                 <div>
                     <label for="vidStep">Video color step</label>
                     <input id="vidStep" type="number" min="4" max="64" value="16">
-                    <div class="hint">Smaller value = more accurate colors.</div>
                 </div>
             </div>
             <div class="bar"><div id="videoFill" class="fill"></div></div>
-            <div id="videoStatus" class="status">Choose a video. Changing video settings automatically rebuilds the current selected video.</div>
-            <div class="mini" id="pageStatus"></div>
+            <div id="videoStatus" class="status">No video selected.</div>
         </div>
         </div>
 
         <div id="modelsPanel" class="tab-panel">
-            <div class="admin-row">
-                <div>
-                    <h2>Roblox Model Browser</h2>
-                    <div class="hint">Search public Creator Store models and open the original Roblox download link.</div>
-                </div>
-                <button id="adminLogoutBtn" type="button" class="secondary">Lock</button>
-            </div>
+            <h2>Models</h2>
             <div class="section">
                 <div class="model-actions">
                     <div>
-                        <label for="modelQuery">Model name</label>
+                        <label for="modelQuery">Search</label>
                         <input id="modelQuery" autocomplete="off" placeholder="castle, car, house...">
                     </div>
                     <button id="modelSearchBtn" type="button">Search</button>
-                </div>
-                <div class="model-filter-row">
-                    <label class="model-filter-check" for="onlyNoMesh">
-                        <input id="onlyNoMesh" type="checkbox">
-                        <span>Only models without MeshParts</span>
-                    </label>
-                    <div id="meshSummary" class="mesh-summary">MeshPart count loads after search.</div>
                 </div>
                 <div id="modelStatus" class="status">Enter a model name.</div>
                 <div id="modelResults" class="model-grid"></div>
@@ -264,22 +205,7 @@ HTML = r'''
                     <div id="modelPageLabel" class="model-page-label">Page 1</div>
                     <button id="modelNextBtn" type="button" class="secondary">Next</button>
                 </div>
-                <div class="download-note">Only model results are shown. Skyboxes, decals, images, photos, textures, wallpapers, cubemaps and similar image-only assets are filtered out. Before Roblox opens, the site reminds you to rename the downloaded file and add the .rbxm extension.</div>
             </div>
-        </div>
-    </div>
-</div>
-
-<div id="adminModal" class="modal-backdrop" aria-hidden="true">
-    <div class="modal-card">
-        <h2>Admin access</h2>
-        <div class="hint">Enter the admin key to open Model Browser.</div>
-        <label for="adminKeyInput">Admin key</label>
-        <input id="adminKeyInput" type="password" autocomplete="current-password" placeholder="Admin key">
-        <div id="adminLoginStatus" class="status"></div>
-        <div class="modal-buttons">
-            <button id="adminCancelBtn" type="button" class="secondary">Cancel</button>
-            <button id="adminLoginBtn" type="button">Open</button>
         </div>
     </div>
 </div>
@@ -292,14 +218,11 @@ const $ = id => document.getElementById(id);
 const state = {
     imageUploaded: false,
     videoConverted: false,
-    adminKey: '',
     modelBusy: false,
     modelQuery: '',
     modelPageTokens: [''],
     modelPageIndex: 0,
     modelNextPageToken: '',
-    modelItems: [],
-    meshScanGeneration: 0,
     imageSettingsTimer: null,
     videoSettingsTimer: null,
     busyImage: false,
@@ -313,53 +236,6 @@ function switchPanel(name) {
     $('modelsPanel').classList.toggle('active', !painter);
     $('painterTabBtn').classList.toggle('active', painter);
     $('modelsTabBtn').classList.toggle('active', !painter);
-    if (painter) state.adminKey = '';
-}
-function showAdminModal() {
-    $('adminLoginStatus').textContent = '';
-    $('adminKeyInput').value = '';
-    $('adminModal').classList.add('open');
-    $('adminModal').setAttribute('aria-hidden', 'false');
-    setTimeout(() => $('adminKeyInput').focus(), 30);
-}
-function hideAdminModal() {
-    $('adminModal').classList.remove('open');
-    $('adminModal').setAttribute('aria-hidden', 'true');
-}
-function adminHeaders(extra) {
-    return Object.assign({ 'X-Admin-Key': state.adminKey }, extra || {});
-}
-async function openModelBrowser() {
-    const key = String($('adminKeyInput').value || '');
-    if (!key) {
-        $('adminLoginStatus').textContent = 'Enter the admin key.';
-        return;
-    }
-    $('adminLoginBtn').disabled = true;
-    $('adminLoginStatus').textContent = 'Checking key...';
-    try {
-        const res = await fetch('/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ key })
-        });
-        const data = await parseJson(res);
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Bad admin key');
-        state.adminKey = key;
-        hideAdminModal();
-        switchPanel('models');
-        if (!data.roblox_key_configured) {
-            $('modelStatus').textContent = 'Server setup required: add ROBLOX_OPEN_CLOUD_KEY in Render Environment.';
-        } else {
-            $('modelStatus').textContent = 'Enter a model name.';
-        }
-        $('modelQuery').focus();
-    } catch (e) {
-        state.adminKey = '';
-        $('adminLoginStatus').textContent = e && e.message ? e.message : String(e);
-    } finally {
-        $('adminLoginBtn').disabled = false;
-    }
 }
 function safeText(value) {
     return String(value == null ? '' : value);
@@ -371,174 +247,25 @@ function cardElement(model) {
     const img = document.createElement('img');
     img.className = 'model-thumb';
     img.loading = 'lazy';
-    img.alt = safeText(model.name || 'Roblox model');
+    img.alt = safeText(model.name || 'Model');
     if (model.thumbnail) img.src = model.thumbnail;
 
     const body = document.createElement('div');
     body.className = 'model-body';
+
     const title = document.createElement('div');
     title.className = 'model-name';
     title.title = safeText(model.name || 'Untitled model');
     title.textContent = safeText(model.name || 'Untitled model');
-
-    const meta = document.createElement('div');
-    meta.className = 'model-meta';
-    meta.textContent = 'by ' + safeText(model.creator || 'Unknown') + ' · ID ' + safeText(model.id);
-
-    const mesh = document.createElement('div');
-    mesh.className = 'mesh-badge checking';
-    mesh.textContent = 'Checking MeshParts...';
-    mesh.title = 'The server is requesting MeshPart Count from Roblox Creator Store details.';
-    card.dataset.assetId = safeText(model.id);
-    card.dataset.meshStatus = 'checking';
 
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = 'Download RBXM';
     button.onclick = () => downloadModel(model, button);
 
-    body.append(title, meta, mesh, button);
+    body.append(title, button);
     card.append(img, body);
     return card;
-}
-function meshBadgeForCard(card) {
-    return card ? card.querySelector('.mesh-badge') : null;
-}
-function updateMeshSummary() {
-    const cards = Array.from(document.querySelectorAll('#modelResults .model-card'));
-    let hasMesh = 0, noMesh = 0, checking = 0, unknown = 0, visible = 0;
-    cards.forEach(card => {
-        const status = card.dataset.meshStatus || 'checking';
-        if (status === 'has_mesh') hasMesh++;
-        else if (status === 'no_mesh') noMesh++;
-        else if (status === 'unknown') unknown++;
-        else checking++;
-        if (!card.classList.contains('mesh-filter-hidden')) visible++;
-    });
-    if (!cards.length) {
-        $('meshSummary').textContent = 'MeshPart count loads after search.';
-        return;
-    }
-    const bits = [];
-    if (noMesh) bits.push('without MeshParts: ' + noMesh);
-    if (hasMesh) bits.push('with MeshParts: ' + hasMesh);
-    if (checking) bits.push('checking: ' + checking);
-    if (unknown) bits.push('count unavailable: ' + unknown);
-    if ($('onlyNoMesh').checked) bits.push('shown: ' + visible);
-    $('meshSummary').textContent = bits.join(' · ');
-}
-function applyMeshFilter() {
-    const onlyNoMesh = !!$('onlyNoMesh').checked;
-    document.querySelectorAll('#modelResults .model-card').forEach(card => {
-        const status = card.dataset.meshStatus || 'checking';
-        card.classList.toggle('mesh-filter-hidden', onlyNoMesh && status !== 'no_mesh');
-    });
-    updateMeshSummary();
-}
-function setCardMeshStatus(assetId, status, meshPartCount, reason) {
-    const card = document.querySelector('#modelResults .model-card[data-asset-id="' + CSS.escape(String(assetId)) + '"]');
-    if (!card) return;
-    const badge = meshBadgeForCard(card);
-    const count = Number(meshPartCount);
-    const validCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
-    card.dataset.meshStatus = status;
-    card.dataset.meshPartCount = validCount === null ? '' : String(validCount);
-    badge.className = 'mesh-badge';
-    if (status === 'has_mesh') {
-        badge.classList.add('has-mesh');
-        badge.textContent = validCount === null ? 'Has MeshPart' : ('Has mesh · ' + validCount + ' MeshPart' + (validCount === 1 ? '' : 's'));
-        badge.title = validCount === null ? 'Roblox reports one or more MeshParts.' : ('Roblox Store MeshPart Count: ' + validCount);
-    } else if (status === 'no_mesh') {
-        badge.classList.add('no-mesh');
-        badge.textContent = 'No MeshParts';
-        badge.title = 'Roblox Store MeshPart Count: 0';
-    } else {
-        badge.classList.add('unknown');
-        badge.textContent = 'MeshPart count unavailable';
-        badge.title = reason || 'Roblox did not return MeshPart Count for this model.';
-    }
-    applyMeshFilter();
-}
-async function checkOneModelMesh(model, generation) {
-    const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
-    if (!assetId || generation !== state.meshScanGeneration) return;
-    const includedCount = Number(model && model.mesh_part_count);
-    if (model && model.mesh_part_count !== null && model.mesh_part_count !== undefined && Number.isFinite(includedCount) && includedCount >= 0) {
-        const fixedCount = Math.floor(includedCount);
-        setCardMeshStatus(assetId, fixedCount > 0 ? 'has_mesh' : 'no_mesh', fixedCount, 'Returned by Creator Store search.');
-        return;
-    }
-    try {
-        const modelName = safeText(model && model.name ? model.name : '');
-        const query = '?name=' + encodeURIComponent(modelName) + '&_=' + Date.now();
-        const res = await fetch('/admin/models/mesh-status/' + encodeURIComponent(assetId) + query, {
-            cache: 'no-store',
-            headers: adminHeaders({ 'Accept': 'application/json' })
-        });
-        const data = await parseJson(res);
-        if (generation !== state.meshScanGeneration) return;
-        if (!res.ok || !data.ok) throw new Error(data.error || 'MeshPart count request failed');
-        setCardMeshStatus(
-            assetId,
-            safeText(data.status || 'unknown'),
-            data.mesh_part_count,
-            safeText(data.reason || '')
-        );
-    } catch (e) {
-        if (generation !== state.meshScanGeneration) return;
-        setCardMeshStatus(assetId, 'unknown', null, e && e.message ? e.message : String(e));
-    }
-}
-async function checkModelMeshes(models) {
-    const generation = ++state.meshScanGeneration;
-    const pending = [];
-    (Array.isArray(models) ? models : []).forEach(model => {
-        const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
-        if (!assetId) return;
-        const includedCount = Number(model && model.mesh_part_count);
-        if (model && model.mesh_part_count !== null && model.mesh_part_count !== undefined && Number.isFinite(includedCount) && includedCount >= 0) {
-            const fixedCount = Math.floor(includedCount);
-            setCardMeshStatus(assetId, fixedCount > 0 ? 'has_mesh' : 'no_mesh', fixedCount, 'Returned by Creator Store search.');
-        } else {
-            pending.push({ id: assetId, name: safeText(model && model.name ? model.name : '') });
-        }
-    });
-    if (!pending.length || generation !== state.meshScanGeneration) {
-        updateMeshSummary();
-        return;
-    }
-    try {
-        const res = await fetch('/admin/models/mesh-status-batch', {
-            method: 'POST',
-            cache: 'no-store',
-            headers: adminHeaders({ 'Accept': 'application/json', 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ models: pending })
-        });
-        const data = await parseJson(res);
-        if (generation !== state.meshScanGeneration) return;
-        if (!res.ok || !data.ok) throw new Error(data.error || 'MeshPart batch request failed');
-        const results = Array.isArray(data.results) ? data.results : [];
-        results.forEach(item => {
-            if (generation !== state.meshScanGeneration) return;
-            setCardMeshStatus(
-                safeText(item.asset_id || ''),
-                safeText(item.status || 'unknown'),
-                item.mesh_part_count,
-                safeText(item.reason || '')
-            );
-        });
-    } catch (e) {
-        if (generation !== state.meshScanGeneration) return;
-        const queue = pending.slice();
-        const worker = async () => {
-            while (queue.length && generation === state.meshScanGeneration) {
-                const item = queue.shift();
-                await checkOneModelMesh({ id: item.id, name: item.name }, generation);
-            }
-        };
-        await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
-    }
-    if (generation === state.meshScanGeneration) updateMeshSummary();
 }
 
 function updateModelPagination() {
@@ -557,6 +284,7 @@ async function searchModels(options) {
         $('modelStatus').textContent = 'Enter at least 2 characters.';
         return;
     }
+
     const reset = options.reset !== false;
     if (reset || query !== state.modelQuery) {
         state.modelQuery = query;
@@ -564,31 +292,25 @@ async function searchModels(options) {
         state.modelPageIndex = 0;
         state.modelNextPageToken = '';
     }
+
     const requestedIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : state.modelPageIndex;
     const pageToken = safeText(state.modelPageTokens[requestedIndex] || '');
     state.modelBusy = true;
     $('modelSearchBtn').disabled = true;
-    $('modelStatus').textContent = 'Searching Roblox Creator Store...';
-    state.meshScanGeneration++;
-    state.modelItems = [];
+    $('modelStatus').textContent = 'Searching...';
     $('modelResults').replaceChildren();
-    $('meshSummary').textContent = 'Waiting for search results...';
     updateModelPagination();
+
     try {
         const params = new URLSearchParams({ q: query, limit: '24', _: String(Date.now()) });
         if (pageToken) params.set('page_token', pageToken);
-        const res = await fetch('/admin/models/search?' + params.toString(), {
+        const res = await fetch('/models/search?' + params.toString(), {
             cache: 'no-store',
-            headers: adminHeaders({ 'Accept': 'application/json' })
+            headers: { 'Accept': 'application/json' }
         });
         const data = await parseJson(res);
-        if (res.status === 401 || res.status === 403) {
-            state.adminKey = '';
-            switchPanel('painter');
-            showAdminModal();
-            throw new Error(data.error || 'Admin access expired');
-        }
         if (!res.ok || !data.ok) throw new Error(data.error || 'Search failed');
+
         state.modelPageIndex = requestedIndex;
         state.modelNextPageToken = safeText(data.next_page_token || '');
         if (state.modelNextPageToken) {
@@ -597,25 +319,16 @@ async function searchModels(options) {
         } else {
             state.modelPageTokens.length = requestedIndex + 1;
         }
+
         const models = Array.isArray(data.models) ? data.models : [];
-        const filtered = Number(data.filtered_count || 0);
-        const suffix = filtered > 0 ? (' · hidden image-only: ' + filtered) : '';
-        $('modelStatus').textContent = models.length
-            ? ('Page ' + (requestedIndex + 1) + ' · ' + models.length + ' 3D models' + suffix)
-            : ('No 3D models on this page' + suffix + (state.modelNextPageToken ? '. Try Next.' : '.'));
+        $('modelStatus').textContent = models.length ? (models.length + ' models') : 'No models found.';
         if (!models.length) {
             const empty = document.createElement('div');
             empty.className = 'empty-models';
-            empty.textContent = state.modelNextPageToken
-                ? 'This page only contained image-like assets. Open the next page.'
-                : 'No matching public 3D models.';
+            empty.textContent = 'No models found.';
             $('modelResults').appendChild(empty);
-            $('meshSummary').textContent = 'No models to check on this page.';
         } else {
-            state.modelItems = models;
             models.forEach(model => $('modelResults').appendChild(cardElement(model)));
-            applyMeshFilter();
-            checkModelMeshes(models);
         }
     } catch (e) {
         $('modelStatus').textContent = 'Search error: ' + (e && e.message ? e.message : e);
@@ -625,6 +338,7 @@ async function searchModels(options) {
         updateModelPagination();
     }
 }
+
 async function openPreviousModelPage() {
     if (state.modelBusy || state.modelPageIndex <= 0) return;
     await searchModels({ reset: false, pageIndex: state.modelPageIndex - 1 });
@@ -635,46 +349,30 @@ async function openNextModelPage() {
     await searchModels({ reset: false, pageIndex: state.modelPageIndex + 1 });
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-function responseFilename(res, fallback) {
-    const value = res.headers.get('Content-Disposition') || '';
-    const utf = value.match(/filename\*=UTF-8''([^;]+)/i);
-    if (utf) {
-        try { return decodeURIComponent(utf[1]); } catch (e) {}
-    }
-    const normal = value.match(/filename="?([^";]+)"?/i);
-    return normal ? normal[1] : fallback;
-}
 function downloadModel(model, button) {
     const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
     if (!assetId) {
-        $('modelStatus').textContent = 'Download error: bad Asset ID';
+        $('modelStatus').textContent = 'Download error: bad ID';
         return;
     }
 
     const modelName = safeText(model && model.name ? model.name : ('model_' + assetId));
-    const downloadUrl = 'https://assetdelivery.roblox.com/v1/asset?id=' + encodeURIComponent(assetId);
-
-    $('modelStatus').textContent = 'After downloading, rename the file and add .rbxm';
-    alert(
-        'Roblox will now open the original download link.\n\n' +
-        'After the file downloads, rename it and add this extension:\n.rbxm\n\n' +
-        'Suggested name: ' + modelName + '.rbxm'
-    );
-
-    window.location.assign(downloadUrl);
+    $('modelStatus').textContent = 'Add .rbxm to the downloaded file name.';
+    alert('Add .rbxm to the downloaded file name.\n\nSuggested name: ' + modelName + '.rbxm');
+    window.location.assign('https://assetdelivery.roblox.com/v1/asset?id=' + encodeURIComponent(assetId));
 }
+
 $('painterTabBtn').onclick = () => switchPanel('painter');
-$('modelsTabBtn').onclick = showAdminModal;
-$('adminCancelBtn').onclick = hideAdminModal;
-$('adminLoginBtn').onclick = openModelBrowser;
-$('adminLogoutBtn').onclick = () => switchPanel('painter');
+$('modelsTabBtn').onclick = () => {
+    switchPanel('models');
+    $('modelQuery').focus();
+};
 $('modelSearchBtn').onclick = () => searchModels({ reset: true, pageIndex: 0 });
 $('modelPrevBtn').onclick = openPreviousModelPage;
 $('modelNextBtn').onclick = openNextModelPage;
-$('onlyNoMesh').addEventListener('change', applyMeshFilter);
-$('modelQuery').addEventListener('keydown', e => { if (e.key === 'Enter') searchModels({ reset: true, pageIndex: 0 }); });
-$('adminKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') openModelBrowser(); });
-$('adminModal').addEventListener('click', e => { if (e.target === $('adminModal')) hideAdminModal(); });
+$('modelQuery').addEventListener('keydown', e => {
+    if (e.key === 'Enter') searchModels({ reset: true, pageIndex: 0 });
+});
 
 function cleanPort(v) {
     const p = String(v || '').replace(/\D+/g, '').slice(0, 8);
@@ -909,7 +607,6 @@ async function convertVideo(autoTriggered) {
         await postJSON('/video_json/finish', { port: cfg.port, key: cfg.key });
         state.videoConverted = true;
         setVideoProgress(frameCount, frameCount, 'Video ready: ' + w + 'x' + h + ' · ' + frameCount + ' frames · ' + cfg.fps + ' FPS');
-        $('pageStatus').textContent = 'Changes saved for this port.';
     } catch (e) {
         $('videoStatus').textContent = 'Video error: ' + (e && e.message ? e.message : e);
         $('videoFill').style.width = '0%';
@@ -1280,37 +977,10 @@ def find_frame(port: str, index: int, meta: Dict[str, Any]) -> Optional[Dict[str
     return None
 
 
-
-# ---------- Roblox model browser ----------
-def admin_key_from_request() -> str:
-    key = request.headers.get("X-Admin-Key", "")
-    if key:
-        return key
-    body = request.get_json(silent=True)
-    if isinstance(body, dict):
-        return str(body.get("key", ""))
-    return str(request.values.get("key", ""))
-
-
-def admin_authorized() -> bool:
-    if session.get("admin_authorized") is True:
-        return True
-    supplied = admin_key_from_request()
-    return bool(supplied) and hmac.compare_digest(supplied, ADMIN_KEY)
-
-
-def require_admin_response():
-    if admin_authorized():
-        return None
-    return json_error("Bad admin key", 403)
-
-
+# ---------- model browser ----------
 def roblox_headers(require_open_cloud: bool = False) -> Dict[str, str]:
     if require_open_cloud and not ROBLOX_OPEN_CLOUD_KEY:
-        raise RuntimeError(
-            "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY. "
-            "Add a Roblox Open Cloud API key in Render Environment and redeploy."
-        )
+        raise RuntimeError("Model search is not configured.")
     headers = {
         "Accept": "application/json",
         "User-Agent": "NamelessTools/1.0",
@@ -1333,10 +1003,7 @@ def roblox_json_request(method: str, url: str, require_open_cloud: bool = False,
     if response.status_code >= 400:
         message = response.text[:300].strip()
         if response.status_code in (401, 403) and require_open_cloud:
-            raise RuntimeError(
-                "Open Cloud key was rejected. Check that ROBLOX_OPEN_CLOUD_KEY is valid, active, "
-                "and has permission to search Creator Store assets."
-            )
+            raise RuntimeError("Model search authorization failed.")
         raise RuntimeError(f"Roblox returned HTTP {response.status_code}: {message or 'request failed'}")
     try:
         data = response.json()
@@ -1479,9 +1146,6 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dic
         creator_value = asset.get("creator", item.get("creator"))
         creator = normalize_creator(creator_value)
         description = str(first_nonempty(asset, ("description", "summary"), ""))[:500]
-        search_mesh_count = find_mesh_part_count(item)
-        if search_mesh_count is None and asset is not item:
-            search_mesh_count = find_mesh_part_count(asset)
         models.append({
             "id": asset_id,
             "name": name,
@@ -1489,7 +1153,6 @@ def normalize_model_items(payload: Dict[str, Any], limit: int) -> Tuple[List[Dic
             "description": description,
             "thumbnail": "",
             "asset_type": "Model",
-            "mesh_part_count": search_mesh_count,
         })
         seen.add(asset_id)
         if len(models) >= limit:
@@ -1534,7 +1197,7 @@ def fetch_model_thumbnails(asset_ids: List[int]) -> Dict[int, str]:
 def search_creator_store_models(query: str, limit: int, page_token: str = "") -> Dict[str, Any]:
     if not ROBLOX_OPEN_CLOUD_KEY:
         raise RuntimeError(
-            "Creator Store search is not configured. Set ROBLOX_OPEN_CLOUD_KEY in Render Environment."
+            "Model search is not configured."
         )
 
     page_size = max(1, min(100, int(limit)))
@@ -1575,7 +1238,7 @@ def search_creator_store_models(query: str, limit: int, page_token: str = "") ->
 
     if response.status_code in (401, 403):
         raise RuntimeError(
-            "Open Cloud key was rejected. Check the key and its Creator Store permissions."
+            "Model search authorization failed."
         )
     if response.status_code >= 400:
         message = response.text[:500].strip()
@@ -1796,348 +1459,6 @@ def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
     raise RuntimeError("Roblox did not return the model")
 
 
-
-
-def mesh_cache_file(asset_id: int) -> str:
-    return os.path.join(MESH_SCAN_CACHE_DIR, f"{int(asset_id)}.json")
-
-
-def load_mesh_scan_cache(asset_id: int) -> Optional[Dict[str, Any]]:
-    path = mesh_cache_file(asset_id)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or data.get("source_version") != MESH_DETAILS_SOURCE:
-            return None
-        count = data.get("mesh_part_count")
-        status = str(data.get("status", "unknown"))
-        if status in ("has_mesh", "no_mesh"):
-            if not isinstance(count, int) or count < 0:
-                return None
-        elif status != "unknown":
-            return None
-        created_at = int(data.get("checked_at", 0))
-        ttl = MESH_SCAN_EXACT_TTL if status in ("has_mesh", "no_mesh") else MESH_SCAN_UNKNOWN_TTL
-        if created_at < int(time.time()) - ttl:
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def save_mesh_scan_cache(asset_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
-    payload = dict(result)
-    payload["asset_id"] = int(asset_id)
-    payload["source_version"] = MESH_DETAILS_SOURCE
-    payload["checked_at"] = int(time.time())
-    atomic_write_json(mesh_cache_file(asset_id), payload)
-    return payload
-
-
-def normalize_json_key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-
-
-def parse_nonnegative_count(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, float):
-        return int(value) if value >= 0 and value.is_integer() else None
-    if isinstance(value, str):
-        cleaned = value.replace("\u00a0", " ").strip()
-        cleaned = re.sub(r"[\s,._]", "", cleaned)
-        if cleaned.isdigit():
-            return int(cleaned)
-    return None
-
-
-def find_mesh_part_count(payload: Any) -> Optional[int]:
-    wanted = {"meshpartcount", "meshpartscount", "numberofmeshparts", "meshpartinstancecount", "meshparts"}
-    label_keys = {"name", "label", "title", "displayname", "metric", "metricname", "stat", "statname", "key", "type"}
-    value_keys = {"value", "count", "amount", "displayvalue", "metricvalue", "statvalue", "total"}
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            if normalize_json_key(key) in wanted:
-                count = parse_nonnegative_count(value)
-                if count is not None:
-                    return count
-                if isinstance(value, dict):
-                    for nested_key, nested_value in value.items():
-                        if normalize_json_key(nested_key) in value_keys:
-                            count = parse_nonnegative_count(nested_value)
-                            if count is not None:
-                                return count
-        labels = [normalize_json_key(value) for key, value in payload.items() if normalize_json_key(key) in label_keys and isinstance(value, (str, int))]
-        if any(label in wanted for label in labels):
-            for key, value in payload.items():
-                if normalize_json_key(key) in value_keys:
-                    count = parse_nonnegative_count(value)
-                    if count is not None:
-                        return count
-        for value in payload.values():
-            count = find_mesh_part_count(value)
-            if count is not None:
-                return count
-    elif isinstance(payload, list):
-        for value in payload:
-            count = find_mesh_part_count(value)
-            if count is not None:
-                return count
-    return None
-
-
-def get_mesh_http_session() -> requests.Session:
-    session = getattr(_mesh_http_local, "session", None)
-    if session is None:
-        session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0, pool_block=False)
-        session.mount("https://", adapter)
-        session.headers.update({
-            "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        })
-        _mesh_http_local.session = session
-    return session
-
-
-def trusted_creator_store_page(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    return parsed.scheme == "https" and parsed.hostname == "create.roblox.com"
-
-
-def creator_store_slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "")).strip("-")
-    return slug[:100] or "Model"
-
-
-def read_limited_text_response(response, max_bytes: int = STORE_PAGE_MAX_BYTES) -> str:
-    chunks: List[bytes] = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=65536):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > max_bytes:
-            raise RuntimeError("response is too large")
-        chunks.append(chunk)
-    raw = b"".join(chunks)
-    return raw.decode(response.encoding or "utf-8", errors="replace")
-
-
-def fetch_creator_store_fast_direct_page(asset_id: int, asset_name: str = "") -> str:
-    slug = creator_store_slug(asset_name)
-    url = f"https://create.roblox.com/store/asset/{int(asset_id)}/{slug}"
-    session = get_mesh_http_session()
-    response = session.get(
-        url,
-        headers={
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-            "Cache-Control": "no-cache",
-        },
-        timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
-        allow_redirects=False,
-        stream=True,
-    )
-    try:
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location", "")
-            if location.startswith("/"):
-                location = "https://create.roblox.com" + location
-            if not trusted_creator_store_page(location):
-                raise RuntimeError("unsafe Store redirect")
-            response.close()
-            response = session.get(
-                location,
-                headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
-                timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
-                allow_redirects=False,
-                stream=True,
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}")
-        return read_limited_text_response(response)
-    finally:
-        response.close()
-
-
-def fetch_creator_store_reader_text(asset_id: int, asset_name: str = "") -> str:
-    slug = creator_store_slug(asset_name)
-    reader_url = "https://r.jina.ai/https://create.roblox.com/store/asset/" + str(int(asset_id)) + "/" + slug
-    session = get_mesh_http_session()
-    response = session.get(
-        reader_url,
-        headers={"Accept": "text/plain,text/markdown,*/*;q=0.8", "Cache-Control": "no-cache"},
-        timeout=(MESH_FAST_CONNECT_TIMEOUT, MESH_FAST_READ_TIMEOUT),
-        allow_redirects=False,
-        stream=True,
-    )
-    try:
-        if response.status_code >= 400:
-            raise RuntimeError(f"reader HTTP {response.status_code}")
-        return read_limited_text_response(response)
-    finally:
-        response.close()
-
-def decode_store_embedded_text(page_text: str) -> str:
-    decoded = str(page_text or "")
-    for _ in range(3):
-        before = decoded
-        decoded = html_lib.unescape(decoded)
-        decoded = re.sub(
-            r"\\u([0-9a-fA-F]{4})",
-            lambda m: chr(int(m.group(1), 16)),
-            decoded,
-        )
-        decoded = re.sub(
-            r"\\x([0-9a-fA-F]{2})",
-            lambda m: chr(int(m.group(1), 16)),
-            decoded,
-        )
-        decoded = decoded.replace('\\"', '"').replace("\\'", "'")
-        decoded = decoded.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
-        if decoded == before:
-            break
-    return decoded
-
-
-def store_page_confirms_model_details(page_text: str, asset_id: int) -> bool:
-    if not page_text:
-        return False
-    decoded = decode_store_embedded_text(page_text)
-    visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", decoded, flags=re.IGNORECASE | re.DOTALL)
-    visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.IGNORECASE | re.DOTALL)
-    visible = re.sub(r"<[^>]*>", " ", visible)
-    visible = re.sub(r"[`*_#|\[\]()]", " ", visible)
-    visible = re.sub(r"\s+", " ", visible).strip().lower()
-    decoded_lower = decoded.lower()
-
-    blocked_markers = (
-        "page not found",
-        "asset not found",
-        "access denied",
-        "not authorised",
-        "not authorized",
-        "captcha",
-        "too many requests",
-        "something went wrong",
-    )
-    if any(marker in visible for marker in blocked_markers):
-        return False
-
-    detail_markers = (
-        "contains scripts",
-        "reviews",
-        "created",
-        "updated",
-        "triangle count",
-        "vertices count",
-        "script count",
-        "audio count",
-        "model details",
-    )
-    marker_count = sum(1 for marker in detail_markers if marker in visible)
-    has_model_details = "model details" in visible
-    has_asset_url = f"/store/asset/{int(asset_id)}" in decoded_lower
-
-    # A real Store model page always exposes several Model Details fields.
-    # Roblox omits the MeshPart Count row entirely when its value is zero.
-    return (has_model_details and marker_count >= 3) or (has_asset_url and marker_count >= 4)
-
-
-def find_mesh_part_count_in_store_html(page_html: str) -> Optional[int]:
-    if not page_html:
-        return None
-    decoded = decode_store_embedded_text(page_html)
-    key_patterns = (
-        r'["\'](?:meshPartCount|meshPartsCount|meshpartCount|mesh_part_count|meshPartInstanceCount)["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
-        r'["\']MeshPart\s*Count["\']\s*:\s*["\']?([0-9][0-9,\u00a0 ]{0,20})',
-    )
-    for pattern in key_patterns:
-        for match in re.finditer(pattern, decoded, flags=re.IGNORECASE):
-            count = parse_nonnegative_count(match.group(1))
-            if count is not None:
-                return count
-
-    # Works for both rendered HTML and markdown/text returned by a reader.
-    visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", decoded, flags=re.IGNORECASE | re.DOTALL)
-    visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.IGNORECASE | re.DOTALL)
-    visible = re.sub(r"<[^>]*>", " ", visible)
-    visible = re.sub(r"[`*_#|\[\]()]", " ", visible)
-    visible = re.sub(r"\s+", " ", visible)
-    match = re.search(
-        r"\bMeshPart\s*Count\b[^0-9]{0,80}([0-9][0-9,\u00a0 ]{0,20})",
-        visible,
-        flags=re.IGNORECASE,
-    )
-    return parse_nonnegative_count(match.group(1)) if match else None
-
-
-def get_model_mesh_status(asset_id: int, asset_name: str = "", force: bool = False) -> Dict[str, Any]:
-    if not force:
-        cached = load_mesh_scan_cache(asset_id)
-        if cached:
-            cached["cached"] = True
-            return cached
-
-    attempts: List[str] = []
-    count: Optional[int] = None
-    source = ""
-
-    # Fast path: the rendered public Store text contains the same technical
-    # details shown in the browser and is usually cached upstream.
-    try:
-        reader_text = fetch_creator_store_reader_text(asset_id, asset_name)
-        count = find_mesh_part_count_in_store_html(reader_text)
-        if count is not None:
-            source = "creator_store_reader_fast"
-        elif store_page_confirms_model_details(reader_text, asset_id):
-            count = 0
-            source = "creator_store_reader_missing_row_means_zero"
-        else:
-            attempts.append("reader text had no recognizable Model Details")
-    except Exception as exc:
-        attempts.append("reader " + str(exc))
-
-    # One direct Store request is kept only as a fallback. Older versions made
-    # many requests with several URLs and user agents, which caused the delay.
-    if count is None:
-        try:
-            page_html = fetch_creator_store_fast_direct_page(asset_id, asset_name)
-            count = find_mesh_part_count_in_store_html(page_html)
-            if count is not None:
-                source = "creator_store_direct_fast"
-            elif store_page_confirms_model_details(page_html, asset_id):
-                count = 0
-                source = "creator_store_direct_missing_row_means_zero"
-            else:
-                attempts.append("direct Store page had no recognizable Model Details")
-        except Exception as exc:
-            attempts.append("direct " + str(exc))
-
-    if count is None:
-        result = {
-            "status": "unknown",
-            "mesh_part_count": None,
-            "reason": "; ".join(attempts)[:900] or "MeshPart Count was not returned",
-            "source": "creator_store_fast_batch",
-        }
-    else:
-        result = {
-            "status": "has_mesh" if count > 0 else "no_mesh",
-            "mesh_part_count": int(count),
-            "reason": "",
-            "source": source,
-        }
-    result["cached"] = False
-    return save_mesh_scan_cache(asset_id, result)
-
 def cleanup_model_downloads() -> None:
     cutoff = time.time() - MODEL_DOWNLOAD_TTL
     try:
@@ -2200,27 +1521,8 @@ def safe_download_name(asset_id: int, extension: str) -> str:
     return f"roblox_model_{asset_id}{extension}"
 
 
-@app.route("/admin/login", methods=["POST"])
-def admin_login():
-    supplied = admin_key_from_request()
-    if not supplied or not hmac.compare_digest(supplied, ADMIN_KEY):
-        time.sleep(0.15)
-        return json_error("Bad admin key", 403)
-    session.clear()
-    session["admin_authorized"] = True
-    session["admin_login_at"] = int(time.time())
-    return jsonify({
-        "ok": True,
-        "version": APP_VERSION,
-        "roblox_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
-    })
-
-
-@app.route("/admin/models/search", methods=["GET"])
-def admin_models_search():
-    denied = require_admin_response()
-    if denied:
-        return denied
+@app.route("/models/search", methods=["GET"])
+def models_search():
     query = re.sub(r"\s+", " ", request.args.get("q", "")).strip()[:80]
     if len(query) < 2:
         return json_error("Enter at least 2 characters", 400)
@@ -2230,14 +1532,14 @@ def admin_models_search():
         return json_error("Bad page token", 400)
     if not ROBLOX_OPEN_CLOUD_KEY:
         return json_error(
-            "Creator Store search requires ROBLOX_OPEN_CLOUD_KEY in Render Environment.",
+            "Model search is temporarily unavailable.",
             503,
             {"setup_required": True},
         )
     try:
         result = search_creator_store_models(query, limit, page_token)
     except Exception as e:
-        return json_error("Roblox search failed: " + str(e), 502)
+        return json_error("Search failed: " + str(e), 502)
     models = result.get("models", [])
     response = jsonify({
         "ok": True,
@@ -2255,111 +1557,8 @@ def admin_models_search():
     return response
 
 
-@app.route("/admin/models/mesh-status-batch", methods=["POST"])
-def admin_model_mesh_status_batch():
-    denied = require_admin_response()
-    if denied:
-        return denied
-    body = request.get_json(silent=True)
-    raw_models = body.get("models", []) if isinstance(body, dict) else []
-    if not isinstance(raw_models, list):
-        return json_error("models must be a list", 400)
-
-    items: List[Tuple[int, str]] = []
-    seen = set()
-    for raw in raw_models[:30]:
-        if not isinstance(raw, dict):
-            continue
-        asset_id_text = re.sub(r"\D+", "", str(raw.get("id", "")))
-        if not asset_id_text:
-            continue
-        asset_id = int(asset_id_text)
-        if asset_id <= 0 or asset_id in seen:
-            continue
-        seen.add(asset_id)
-        items.append((asset_id, str(raw.get("name", "")).strip()[:160]))
-
-    if not items:
-        return jsonify({"ok": True, "results": [], "count": 0, "version": APP_VERSION})
-
-    started = time.time()
-    results_by_id: Dict[int, Dict[str, Any]] = {}
-    workers = min(MESH_CHECK_WORKERS, len(items))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mesh-check") as executor:
-        future_map = {
-            executor.submit(get_model_mesh_status, asset_id, name, False): asset_id
-            for asset_id, name in items
-        }
-        for future in as_completed(future_map):
-            asset_id = future_map[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {
-                    "status": "unknown",
-                    "mesh_part_count": None,
-                    "reason": str(exc),
-                    "source": "batch_exception",
-                    "cached": False,
-                    "checked_at": int(time.time()),
-                }
-            results_by_id[asset_id] = result
-
-    output = []
-    for asset_id, _name in items:
-        result = results_by_id.get(asset_id, {})
-        output.append({
-            "asset_id": asset_id,
-            "status": str(result.get("status", "unknown")),
-            "mesh_part_count": result.get("mesh_part_count"),
-            "reason": str(result.get("reason", "")),
-            "source": str(result.get("source", "creator_store_fast_batch")),
-            "cached": bool(result.get("cached", False)),
-            "checked_at": int(result.get("checked_at", int(time.time()))),
-        })
-
-    response = jsonify({
-        "ok": True,
-        "results": output,
-        "count": len(output),
-        "workers": workers,
-        "elapsed_ms": int((time.time() - started) * 1000),
-        "version": APP_VERSION,
-    })
-    response.headers["Cache-Control"] = "no-store, max-age=0"
-    return response
-
-
-@app.route("/admin/models/mesh-status/<asset_id>", methods=["GET"])
-def admin_model_mesh_status(asset_id: str):
-    denied = require_admin_response()
-    if denied:
-        return denied
-    if not asset_id.isdigit() or int(asset_id) <= 0:
-        return json_error("Bad asset ID", 400)
-    force = request.args.get("force", "").strip().lower() in ("1", "true", "yes")
-    asset_name = request.args.get("name", "").strip()[:160]
-    result = get_model_mesh_status(int(asset_id), asset_name=asset_name, force=force)
-    response = jsonify({
-        "ok": True,
-        "asset_id": int(asset_id),
-        "status": str(result.get("status", "unknown")),
-        "mesh_part_count": result.get("mesh_part_count"),
-        "reason": str(result.get("reason", "")),
-        "source": str(result.get("source", "creator_store_technical_details")),
-        "cached": bool(result.get("cached", False)),
-        "checked_at": int(result.get("checked_at", int(time.time()))),
-        "version": APP_VERSION,
-    })
-    response.headers["Cache-Control"] = "no-store, max-age=0"
-    return response
-
-
-@app.route("/admin/models/prepare-download/<asset_id>", methods=["POST"])
-def admin_models_prepare_download(asset_id: str):
-    denied = require_admin_response()
-    if denied:
-        return denied
+@app.route("/models/prepare-download/<asset_id>", methods=["POST"])
+def models_prepare_download(asset_id: str):
     if not asset_id.isdigit():
         return json_error("Bad asset ID", 400)
     numeric_id = int(asset_id)
@@ -2370,7 +1569,7 @@ def admin_models_prepare_download(asset_id: str):
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
     except Exception as e:
-        return json_error("Roblox download failed: " + str(e), 502)
+        return json_error("Download failed: " + str(e), 502)
     base_name = clean_model_name(requested_name, numeric_id)
     filename = base_name + extension
     token = create_download_token(raw, filename, mime)
@@ -2378,17 +1577,14 @@ def admin_models_prepare_download(asset_id: str):
         "ok": True,
         "filename": filename,
         "size": len(raw),
-        "download_url": f"/admin/models/file/{token}",
+        "download_url": f"/models/file/{token}",
         "asset_id": numeric_id,
         "version": APP_VERSION,
     })
 
 
-@app.route("/admin/models/file/<token>", methods=["GET"])
-def admin_models_file(token: str):
-    denied = require_admin_response()
-    if denied:
-        return denied
+@app.route("/models/file/<token>", methods=["GET"])
+def models_file(token: str):
     try:
         raw, filename, mime = consume_download_token(token)
     except Exception as e:
@@ -2402,11 +1598,8 @@ def admin_models_file(token: str):
     return response
 
 
-@app.route("/admin/models/download/<asset_id>", methods=["GET"])
-def admin_models_download(asset_id: str):
-    denied = require_admin_response()
-    if denied:
-        return denied
+@app.route("/models/download/<asset_id>", methods=["GET"])
+def models_download(asset_id: str):
     if not asset_id.isdigit():
         return json_error("Bad asset ID", 400)
     numeric_id = int(asset_id)
@@ -2415,7 +1608,7 @@ def admin_models_download(asset_id: str):
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
     except Exception as e:
-        return json_error("Roblox download failed: " + str(e), 502)
+        return json_error("Download failed: " + str(e), 502)
     filename = safe_download_name(numeric_id, extension)
     response = Response(raw, status=200, mimetype=mime)
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -2427,27 +1620,7 @@ def admin_models_download(asset_id: str):
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({
-        "ok": True,
-        "version": APP_VERSION,
-        "search_endpoint": "/toolbox-service/v2/assets:search",
-        "search_method": "GET",
-        "search_query_template": "?searchCategoryType=Model&maxPageSize=24&query=castle&pageToken=...",
-        "pagination": "nextPageToken -> pageToken",
-        "image_only_filter": True,
-        "mesh_detection": "search payload -> one batched parallel Store-text check -> one direct fallback; missing MeshPart row on a confirmed model page means 0",
-        "mesh_filter": "models with count 0, including confirmed Store pages where the MeshPart row is omitted",
-        "mesh_details_sources": ["search payload", "batched rendered public Store text", "single direct Creator Store fallback"],
-        "mesh_batch_workers": MESH_CHECK_WORKERS,
-        "download_flow": "browser redirect -> https://assetdelivery.roblox.com/v1/asset?id={assetId}",
-        "download_endpoint": "https://assetdelivery.roblox.com/v1/asset?id={assetId}",
-        "download_notice": "rename the downloaded file and add .rbxm",
-        "download_uses_server_proxy": False,
-        "asset_id_priority": "assetId before id",
-        "search_category_type": "Model",
-        "model_asset_type": 10,
-        "open_cloud_key_configured": bool(ROBLOX_OPEN_CLOUD_KEY),
-    })
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 @app.after_request
@@ -2473,7 +1646,6 @@ def index():
         abs_max_res=ABS_MAX_RES,
         video_max_res=VIDEO_MAX_RES,
         video_max_frames=VIDEO_MAX_FRAMES,
-        app_version=APP_VERSION,
     )
 
 
