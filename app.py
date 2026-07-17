@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v24-direct-rbxm-2026-07-17"
+APP_VERSION = "model-search-v25-auto-save-rbxm-2026-07-17"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ROBLOX_OPEN_CLOUD_KEY = os.environ.get("ROBLOX_OPEN_CLOUD_KEY", "").strip()
@@ -350,7 +350,6 @@ async function openNextModelPage() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 async function downloadModel(model, button) {
-    if (state.modelBusy) return;
     const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
     if (!assetId) {
         $('modelStatus').textContent = 'Download error: bad ID';
@@ -361,31 +360,31 @@ async function downloadModel(model, button) {
     const oldText = button.textContent;
     button.disabled = true;
     button.textContent = 'Preparing...';
-    $('modelStatus').textContent = 'Downloading model from Roblox...';
+    $('modelStatus').textContent = 'Preparing model file...';
 
     try {
         const res = await fetch('/models/prepare-download/' + encodeURIComponent(assetId), {
             method: 'POST',
             cache: 'no-store',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify({ name: modelName })
         });
         const data = await parseJson(res);
         if (!res.ok || !data.ok) throw new Error(data.error || 'Download failed');
 
-        $('modelStatus').textContent = 'Ready: ' + safeText(data.filename || (modelName + '.rbxm'));
-        button.textContent = 'Downloading...';
-        window.location.assign(data.download_url);
+        const link = document.createElement('a');
+        link.href = data.download_url;
+        link.download = data.filename || (modelName + '.rbxm');
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        $('modelStatus').textContent = 'Downloading: ' + (data.filename || (modelName + '.rbxm'));
     } catch (e) {
         $('modelStatus').textContent = 'Download error: ' + (e && e.message ? e.message : e);
     } finally {
-        setTimeout(() => {
-            button.disabled = false;
-            button.textContent = oldText;
-        }, 900);
+        button.disabled = false;
+        button.textContent = oldText;
     }
 }
 
@@ -1423,6 +1422,41 @@ def fetch_from_asset_endpoint(url: str, headers: Dict[str, str], label: str) -> 
     return raw, extension, mime
 
 
+def save_creator_store_model(asset_id: int) -> str:
+    if not ROBLOX_OPEN_CLOUD_KEY:
+        raise PermissionError("ROBLOX_OPEN_CLOUD_KEY is missing")
+
+    response = requests.post(
+        "https://apis.roblox.com/toolbox-service/v1/saves",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
+            "User-Agent": "NamelessTools/1.0",
+        },
+        json={"targetType": "Model", "targetId": int(asset_id)},
+        timeout=(7, ROBLOX_HTTP_TIMEOUT),
+        allow_redirects=False,
+    )
+
+    if response.status_code == 201:
+        return "saved"
+    if response.status_code == 409:
+        return "already_saved"
+    if response.status_code in (401, 403):
+        raise PermissionError(
+            "The Open Cloud key needs creator-store-save:write permission to add free models to the account"
+        )
+    detail = response_error_text(response)
+    if response.status_code == 404:
+        raise RuntimeError("This model is unavailable or cannot be saved from Creator Store")
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Creator Store save returned HTTP {response.status_code}: {detail or 'request failed'}"
+        )
+    return "saved"
+
+
 def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
     # Restored from the early working downloader: never stop after an
     # Open Cloud 401/403. Try every Asset Delivery variant in sequence.
@@ -1433,6 +1467,7 @@ def fetch_model_file(asset_id: int) -> Tuple[bytes, str, str]:
             f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
             {
                 "Accept": "application/octet-stream, application/xml, application/json",
+                "Accept-Encoding": "gzip, deflate",
                 "x-api-key": ROBLOX_OPEN_CLOUD_KEY,
                 "User-Agent": "NamelessTools/1.0",
             },
@@ -1501,20 +1536,24 @@ def cleanup_model_downloads() -> None:
 
 
 def clean_model_name(value: str, asset_id: int) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "", str(value or ""))
-    name = re.sub(r"\s+", " ", name).strip(" .")[:100]
-    return name or f"roblox_model_{asset_id}"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]+', "", str(value or ""))
+    name = re.sub(r"\s+", " ", name).strip(" .")[:80].strip(" .")
+    if not name:
+        name = f"roblox_model_{asset_id}"
+    if name.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        name = "_" + name
+    return name
 
 
-def content_disposition_attachment(filename: str) -> str:
-    clean = str(filename or "roblox_model.rbxm").replace("\r", "").replace("\n", "")
-    ascii_fallback = clean.encode("ascii", errors="ignore").decode("ascii")
-    ascii_fallback = re.sub(r'[^A-Za-z0-9 _().\-]+', "", ascii_fallback).strip(" .")
-    if not ascii_fallback:
-        extension = os.path.splitext(clean)[1].lower()
-        ascii_fallback = "roblox_model" + (extension if extension in (".rbxm", ".rbxmx") else ".rbxm")
-    encoded = quote(clean, safe="")
-    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+def attachment_content_disposition(filename: str) -> str:
+    safe_name = str(filename or "roblox_model.rbxm").replace('"', "").replace("\r", "").replace("\n", "")
+    root, extension = os.path.splitext(safe_name)
+    ascii_root = root.encode("ascii", errors="ignore").decode("ascii")
+    ascii_root = re.sub(r"[^A-Za-z0-9 _().\-]+", "", ascii_root).strip(" .") or "roblox_model"
+    ascii_extension = re.sub(r"[^A-Za-z0-9.]", "", extension) or ".rbxm"
+    fallback = (ascii_root[:80] + ascii_extension).replace('"', "")
+    encoded = quote(safe_name, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def create_download_token(raw: bytes, filename: str, mime: str) -> str:
@@ -1604,10 +1643,25 @@ def models_prepare_download(asset_id: str):
         return json_error("Bad asset ID", 400)
     body = request.get_json(silent=True)
     requested_name = body.get("name", "") if isinstance(body, dict) else ""
+    save_error = ""
+    try:
+        save_creator_store_model(numeric_id)
+    except Exception as e:
+        save_error = str(e)
+
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
     except Exception as e:
-        return json_error("Download failed: " + str(e), 502)
+        download_error = str(e)
+        if save_error:
+            message = (
+                "Open Cloud permissions are incomplete. Add creator-store-save:write and "
+                "legacy-asset:manage to ROBLOX_OPEN_CLOUD_KEY, save the key, then redeploy. "
+                f"Save step: {save_error}. Download step: {download_error}"
+            )
+        else:
+            message = "Download failed: " + download_error
+        return json_error(message, 502)
     base_name = clean_model_name(requested_name, numeric_id)
     filename = base_name + extension
     token = create_download_token(raw, filename, mime)
@@ -1628,7 +1682,7 @@ def models_file(token: str):
     except Exception as e:
         return json_error(str(e), 404)
     response = Response(raw, status=200, mimetype=mime)
-    response.headers["Content-Disposition"] = content_disposition_attachment(filename)
+    response.headers["Content-Disposition"] = attachment_content_disposition(filename)
     response.headers["Content-Length"] = str(len(raw))
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -1642,13 +1696,28 @@ def models_download(asset_id: str):
     numeric_id = int(asset_id)
     if numeric_id <= 0:
         return json_error("Bad asset ID", 400)
+    save_error = ""
+    try:
+        save_creator_store_model(numeric_id)
+    except Exception as e:
+        save_error = str(e)
+
     try:
         raw, extension, mime = fetch_model_file(numeric_id)
     except Exception as e:
-        return json_error("Download failed: " + str(e), 502)
+        download_error = str(e)
+        if save_error:
+            message = (
+                "Open Cloud permissions are incomplete. Add creator-store-save:write and "
+                "legacy-asset:manage to ROBLOX_OPEN_CLOUD_KEY. "
+                f"Save step: {save_error}. Download step: {download_error}"
+            )
+        else:
+            message = "Download failed: " + download_error
+        return json_error(message, 502)
     filename = safe_download_name(numeric_id, extension)
     response = Response(raw, status=200, mimetype=mime)
-    response.headers["Content-Disposition"] = content_disposition_attachment(filename)
+    response.headers["Content-Disposition"] = attachment_content_disposition(filename)
     response.headers["Content-Length"] = str(len(raw))
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["X-Content-Type-Options"] = "nosniff"
