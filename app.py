@@ -4,7 +4,7 @@ import re
 import secrets
 import time
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +16,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 
 app = Flask(__name__)
-APP_VERSION = "model-search-v23-clean-2026-07-16"
+APP_VERSION = "model-search-v24-auto-rbxm-2026-07-17"
 
 IMAGE_KEY = os.environ.get("IMAGE_KEY", "").strip()
 ROBLOX_OPEN_CLOUD_KEY = os.environ.get("ROBLOX_OPEN_CLOUD_KEY", "").strip()
@@ -349,7 +349,7 @@ async function openNextModelPage() {
     await searchModels({ reset: false, pageIndex: state.modelPageIndex + 1 });
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-function downloadModel(model, button) {
+async function downloadModel(model, button) {
     const assetId = String(model && model.id ? model.id : '').replace(/\D+/g, '');
     if (!assetId) {
         $('modelStatus').textContent = 'Download error: bad ID';
@@ -357,9 +357,35 @@ function downloadModel(model, button) {
     }
 
     const modelName = safeText(model && model.name ? model.name : ('model_' + assetId));
-    $('modelStatus').textContent = 'Add .rbxm to the downloaded file name.';
-    alert('Add .rbxm to the downloaded file name.\n\nSuggested name: ' + modelName + '.rbxm');
-    window.location.assign('https://assetdelivery.roblox.com/v1/asset?id=' + encodeURIComponent(assetId));
+    const oldText = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Preparing...';
+    $('modelStatus').textContent = 'Preparing model file...';
+
+    try {
+        const res = await fetch('/models/prepare-download/' + encodeURIComponent(assetId), {
+            method: 'POST',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ name: modelName })
+        });
+        const data = await parseJson(res);
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Download failed');
+
+        const link = document.createElement('a');
+        link.href = data.download_url;
+        link.download = data.filename || (modelName + '.rbxm');
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        $('modelStatus').textContent = 'Downloading: ' + (data.filename || (modelName + '.rbxm'));
+    } catch (e) {
+        $('modelStatus').textContent = 'Download error: ' + (e && e.message ? e.message : e);
+    } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+    }
 }
 
 $('painterTabBtn').onclick = () => switchPanel('painter');
@@ -1474,9 +1500,24 @@ def cleanup_model_downloads() -> None:
 
 
 def clean_model_name(value: str, asset_id: int) -> str:
-    name = re.sub(r"[^A-Za-z0-9 _().\-]+", "", str(value or "")).strip()
-    name = re.sub(r"\s+", " ", name)[:80]
-    return name or f"roblox_model_{asset_id}"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]+', "", str(value or ""))
+    name = re.sub(r"\s+", " ", name).strip(" .")[:80].strip(" .")
+    if not name:
+        name = f"roblox_model_{asset_id}"
+    if name.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        name = "_" + name
+    return name
+
+
+def attachment_content_disposition(filename: str) -> str:
+    safe_name = str(filename or "roblox_model.rbxm").replace('"', "").replace("\r", "").replace("\n", "")
+    root, extension = os.path.splitext(safe_name)
+    ascii_root = root.encode("ascii", errors="ignore").decode("ascii")
+    ascii_root = re.sub(r"[^A-Za-z0-9 _().\-]+", "", ascii_root).strip(" .") or "roblox_model"
+    ascii_extension = re.sub(r"[^A-Za-z0-9.]", "", extension) or ".rbxm"
+    fallback = (ascii_root[:80] + ascii_extension).replace('"', "")
+    encoded = quote(safe_name, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def create_download_token(raw: bytes, filename: str, mime: str) -> str:
@@ -1590,8 +1631,7 @@ def models_file(token: str):
     except Exception as e:
         return json_error(str(e), 404)
     response = Response(raw, status=200, mimetype=mime)
-    safe_header_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
-    response.headers["Content-Disposition"] = f'attachment; filename="{safe_header_name}"'
+    response.headers["Content-Disposition"] = attachment_content_disposition(filename)
     response.headers["Content-Length"] = str(len(raw))
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -1611,7 +1651,7 @@ def models_download(asset_id: str):
         return json_error("Download failed: " + str(e), 502)
     filename = safe_download_name(numeric_id, extension)
     response = Response(raw, status=200, mimetype=mime)
-    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Content-Disposition"] = attachment_content_disposition(filename)
     response.headers["Content-Length"] = str(len(raw))
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["X-Content-Type-Options"] = "nosniff"
